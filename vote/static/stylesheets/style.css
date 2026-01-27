@@ -28,11 +28,11 @@ button i{
 }
 
 button.a{
-  background-color: #0ea5e9;  /* Sky Blue - Canary v5 */
+  background-color: #8b5cf6;  /* Purple - Canary v7 */
 }
 
 button.b{
-  background-color: #f43f5e;  /* Rose/Coral - Canary v5 */
+  background-color: #f59e0b;  /* Amber - Canary v7 */
 }
 
 #tip{
@@ -99,19 +99,19 @@ button.b{
 }
 
 #choice button.a:hover{
-  background-color: #0284c7;  /* Sky Blue hover - Canary v5 */
+  background-color: #7c3aed;  /* Purple hover - Canary v7 */
 }
 
 #choice button.b:hover{
-  background-color: #e11d48;  /* Rose hover - Canary v5 */
+  background-color: #d97706;  /* Amber hover - Canary v7 */
 }
 
 #choice button.a:focus{
-  background-color: #0284c7;  /* Sky Blue focus - Canary v5 */
+  background-color: #7c3aed;  /* Purple focus - Canary v7 */
 }
 
 #choice button.b:focus{
-  background-color: #e11d48;  /* Rose focus - Canary v5 */
+  background-color: #d97706;  /* Amber focus - Canary v7 */
 }
 
 #background-stats{
