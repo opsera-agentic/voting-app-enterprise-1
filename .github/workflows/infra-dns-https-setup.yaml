@@ -1,0 +1,508 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  DNS & HTTPS SETUP - IDEMPOTENT INFRASTRUCTURE                                ║
+# ║                                                                                ║
+# ║  Provisions DNS records and verifies HTTPS/TLS configuration:                  ║
+# ║  • Route53 DNS records                                                         ║
+# ║  • cert-manager ClusterIssuer                                                  ║
+# ║  • TLS certificate verification                                                ║
+# ║  • HTTPS endpoint testing                                                      ║
+# ║                                                                                ║
+# ║  Endpoints:                                                                    ║
+# ║  • DEV: https://opsera-voting-app.agent.opsera.dev                             ║
+# ║  • QA:  https://opsera-voting-app-qa.agent.opsera.dev                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🌐 Infra: DNS & HTTPS Setup"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - verify-only
+          - setup-dns
+          - setup-certmanager
+          - full-setup
+        default: 'verify-only'
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - all
+        default: 'all'
+
+env:
+  AWS_REGION: us-west-2
+  DOMAIN: agent.opsera.dev
+  HOSTED_ZONE_ID: Z00454aborb9KAMPLE  # Replace with actual zone ID
+  SPOKE_CLUSTER: opsera-usw2-np
+  DEV_HOST: opsera-voting-app.agent.opsera.dev
+  QA_HOST: opsera-voting-app-qa.agent.opsera.dev
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 1: PRE-FLIGHT - Check Current State
+  # ════════════════════════════════════════════════════════════════════════════════
+  preflight:
+    name: "🔍 Pre-flight: DNS & HTTPS Check"
+    runs-on: ubuntu-latest
+    outputs:
+      dev_dns_exists: ${{ steps.dns.outputs.dev_exists }}
+      qa_dns_exists: ${{ steps.dns.outputs.qa_exists }}
+      dev_https_works: ${{ steps.https.outputs.dev_works }}
+      qa_https_works: ${{ steps.https.outputs.qa_works }}
+      ingress_lb: ${{ steps.ingress.outputs.lb_hostname }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Get Ingress Load Balancer
+        id: ingress
+        run: |
+          echo "## 🔍 Pre-flight: DNS & HTTPS Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get NGINX ingress controller load balancer
+          LB_HOSTNAME=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -z "$LB_HOSTNAME" ]; then
+            LB_HOSTNAME=$(kubectl get svc -n nginx-ingress nginx-ingress-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          fi
+          
+          if [ -n "$LB_HOSTNAME" ]; then
+            echo "lb_hostname=${LB_HOSTNAME}" >> $GITHUB_OUTPUT
+            echo "| Ingress LB | \`${LB_HOSTNAME}\` |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "lb_hostname=" >> $GITHUB_OUTPUT
+            echo "| Ingress LB | ⚠️ Not found |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check DNS Records
+        id: dns
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📡 DNS Records" >> $GITHUB_STEP_SUMMARY
+          echo "| Hostname | Record Type | Target | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Check DEV DNS
+          DEV_IP=$(dig +short ${{ env.DEV_HOST }} | head -1)
+          if [ -n "$DEV_IP" ]; then
+            echo "dev_exists=true" >> $GITHUB_OUTPUT
+            echo "| \`${{ env.DEV_HOST }}\` | A/CNAME | \`${DEV_IP}\` | ✅ |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "dev_exists=false" >> $GITHUB_OUTPUT
+            echo "| \`${{ env.DEV_HOST }}\` | - | - | ❌ Not found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check QA DNS
+          QA_IP=$(dig +short ${{ env.QA_HOST }} | head -1)
+          if [ -n "$QA_IP" ]; then
+            echo "qa_exists=true" >> $GITHUB_OUTPUT
+            echo "| \`${{ env.QA_HOST }}\` | A/CNAME | \`${QA_IP}\` | ✅ |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "qa_exists=false" >> $GITHUB_OUTPUT
+            echo "| \`${{ env.QA_HOST }}\` | - | - | ❌ Not found |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check HTTPS Endpoints
+        id: https
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔒 HTTPS Verification" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint | Status | Certificate | Expiry |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Check DEV HTTPS
+          DEV_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "https://${{ env.DEV_HOST }}/" 2>/dev/null || echo "000")
+          DEV_CERT=$(echo | openssl s_client -servername ${{ env.DEV_HOST }} -connect ${{ env.DEV_HOST }}:443 2>/dev/null | openssl x509 -noout -dates 2>/dev/null | grep notAfter | cut -d= -f2 || echo "N/A")
+          
+          if [ "$DEV_STATUS" = "200" ] || [ "$DEV_STATUS" = "301" ] || [ "$DEV_STATUS" = "302" ]; then
+            echo "dev_works=true" >> $GITHUB_OUTPUT
+            echo "| \`https://${{ env.DEV_HOST }}\` | ✅ HTTP ${DEV_STATUS} | Valid | ${DEV_CERT} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "dev_works=false" >> $GITHUB_OUTPUT
+            echo "| \`https://${{ env.DEV_HOST }}\` | ❌ HTTP ${DEV_STATUS} | - | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check QA HTTPS
+          QA_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "https://${{ env.QA_HOST }}/" 2>/dev/null || echo "000")
+          QA_CERT=$(echo | openssl s_client -servername ${{ env.QA_HOST }} -connect ${{ env.QA_HOST }}:443 2>/dev/null | openssl x509 -noout -dates 2>/dev/null | grep notAfter | cut -d= -f2 || echo "N/A")
+          
+          if [ "$QA_STATUS" = "200" ] || [ "$QA_STATUS" = "301" ] || [ "$QA_STATUS" = "302" ]; then
+            echo "qa_works=true" >> $GITHUB_OUTPUT
+            echo "| \`https://${{ env.QA_HOST }}\` | ✅ HTTP ${QA_STATUS} | Valid | ${QA_CERT} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "qa_works=false" >> $GITHUB_OUTPUT
+            echo "| \`https://${{ env.QA_HOST }}\` | ❌ HTTP ${QA_STATUS} | - | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 2: SETUP DNS RECORDS (Idempotent)
+  # ════════════════════════════════════════════════════════════════════════════════
+  setup-dns:
+    name: "📡 Setup DNS Records"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    if: |
+      github.event.inputs.action == 'setup-dns' || 
+      github.event.inputs.action == 'full-setup'
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Get Load Balancer Hostname
+        id: lb
+        run: |
+          # Get NGINX ingress controller load balancer
+          LB_HOSTNAME=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -z "$LB_HOSTNAME" ]; then
+            LB_HOSTNAME=$(kubectl get svc -n nginx-ingress nginx-ingress-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          fi
+          
+          if [ -z "$LB_HOSTNAME" ]; then
+            echo "❌ Error: Could not find ingress load balancer"
+            exit 1
+          fi
+          
+          echo "hostname=${LB_HOSTNAME}" >> $GITHUB_OUTPUT
+          echo "Found LB: ${LB_HOSTNAME}"
+
+      - name: Get Route53 Hosted Zone
+        id: zone
+        run: |
+          # Find hosted zone for domain
+          ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "${{ env.DOMAIN }}" \
+            --query "HostedZones[?Name=='${{ env.DOMAIN }}.'].Id" --output text | sed 's|/hostedzone/||')
+          
+          if [ -z "$ZONE_ID" ]; then
+            echo "❌ Error: Could not find hosted zone for ${{ env.DOMAIN }}"
+            exit 1
+          fi
+          
+          echo "zone_id=${ZONE_ID}" >> $GITHUB_OUTPUT
+          echo "Found Zone ID: ${ZONE_ID}"
+
+      - name: Setup DNS Records (Idempotent)
+        run: |
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+          LB_HOSTNAME="${{ steps.lb.outputs.hostname }}"
+          
+          echo "## 📡 DNS Record Setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Hostname | Action | Target |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          ENVS="${{ github.event.inputs.environment }}"
+          [ "$ENVS" = "all" ] && ENVS="dev qa"
+          
+          for ENV in $ENVS; do
+            if [ "$ENV" = "dev" ]; then
+              HOSTNAME="${{ env.DEV_HOST }}"
+            else
+              HOSTNAME="${{ env.QA_HOST }}"
+            fi
+            
+            # Check if record exists
+            EXISTING=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+              --query "ResourceRecordSets[?Name=='${HOSTNAME}.'].Type" --output text 2>/dev/null || echo "")
+            
+            # Delete conflicting A/AAAA records if CNAME needed
+            if echo "$EXISTING" | grep -qE "^A|^AAAA"; then
+              echo "Deleting conflicting A/AAAA records for ${HOSTNAME}..."
+              
+              # Get existing records
+              EXISTING_RECORDS=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+                --query "ResourceRecordSets[?Name=='${HOSTNAME}.']" --output json)
+              
+              # Create delete batch
+              DELETE_BATCH=$(echo "$EXISTING_RECORDS" | jq '[.[] | select(.Type == "A" or .Type == "AAAA") | {Action: "DELETE", ResourceRecordSet: .}]')
+              
+              if [ "$(echo "$DELETE_BATCH" | jq length)" -gt 0 ]; then
+                aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+                  --change-batch "{\"Changes\": $DELETE_BATCH}" || true
+              fi
+            fi
+            
+            # Create/Update CNAME record
+            aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+              --change-batch "{
+                \"Changes\": [{
+                  \"Action\": \"UPSERT\",
+                  \"ResourceRecordSet\": {
+                    \"Name\": \"${HOSTNAME}\",
+                    \"Type\": \"CNAME\",
+                    \"TTL\": 300,
+                    \"ResourceRecords\": [{\"Value\": \"${LB_HOSTNAME}\"}]
+                  }
+                }]
+              }"
+            
+            echo "| \`${HOSTNAME}\` | UPSERT CNAME | \`${LB_HOSTNAME}\` |" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⏳ **Note:** DNS propagation may take 1-5 minutes" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 3: SETUP CERT-MANAGER (Idempotent)
+  # ════════════════════════════════════════════════════════════════════════════════
+  setup-certmanager:
+    name: "🔐 Setup cert-manager"
+    runs-on: ubuntu-latest
+    needs: [preflight, setup-dns]
+    if: |
+      always() &&
+      (github.event.inputs.action == 'setup-certmanager' || 
+       github.event.inputs.action == 'full-setup')
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl and Helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Connect to Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Install cert-manager (Idempotent)
+        run: |
+          echo "## 🔐 cert-manager Setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if cert-manager is installed
+          if kubectl get namespace cert-manager &>/dev/null; then
+            echo "| cert-manager namespace | ✅ Already exists |" >> $GITHUB_STEP_SUMMARY
+          else
+            # Install cert-manager
+            kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.yaml
+            echo "| cert-manager namespace | 🆕 Installed |" >> $GITHUB_STEP_SUMMARY
+            
+            # Wait for cert-manager to be ready
+            echo "Waiting for cert-manager to be ready..."
+            kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s || true
+            kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s || true
+          fi
+
+      - name: Create ClusterIssuer (Idempotent)
+        run: |
+          # Check if ClusterIssuer exists
+          if kubectl get clusterissuer letsencrypt-prod &>/dev/null; then
+            echo "| ClusterIssuer (letsencrypt-prod) | ✅ Already exists |" >> $GITHUB_STEP_SUMMARY
+          else
+            # Create ClusterIssuer
+            cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: devops@opsera.io
+              privateKeySecretRef:
+                name: letsencrypt-prod-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+          EOF
+            echo "| ClusterIssuer (letsencrypt-prod) | 🆕 Created |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Also create staging issuer for testing
+          if ! kubectl get clusterissuer letsencrypt-staging &>/dev/null; then
+            cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: devops@opsera.io
+              privateKeySecretRef:
+                name: letsencrypt-staging-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+          EOF
+            echo "| ClusterIssuer (letsencrypt-staging) | 🆕 Created |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Verify Certificates
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📜 Certificate Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | Certificate | Status | Expiry |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Check DEV certificate
+          DEV_CERT=$(kubectl get certificate -n voting-app-dev voting-app-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "NotFound")
+          DEV_EXPIRY=$(kubectl get certificate -n voting-app-dev voting-app-tls -o jsonpath='{.status.notAfter}' 2>/dev/null || echo "N/A")
+          
+          if [ "$DEV_CERT" = "True" ]; then
+            echo "| voting-app-dev | voting-app-tls | ✅ Ready | ${DEV_EXPIRY} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| voting-app-dev | voting-app-tls | ⏳ ${DEV_CERT} | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check QA certificate
+          QA_CERT=$(kubectl get certificate -n voting-app-qa voting-app-qa-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "NotFound")
+          QA_EXPIRY=$(kubectl get certificate -n voting-app-qa voting-app-qa-tls -o jsonpath='{.status.notAfter}' 2>/dev/null || echo "N/A")
+          
+          if [ "$QA_CERT" = "True" ]; then
+            echo "| voting-app-qa | voting-app-qa-tls | ✅ Ready | ${QA_EXPIRY} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| voting-app-qa | voting-app-qa-tls | ⏳ ${QA_CERT} | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 4: VERIFICATION
+  # ════════════════════════════════════════════════════════════════════════════════
+  verify:
+    name: "✅ Verify HTTPS Endpoints"
+    runs-on: ubuntu-latest
+    needs: [preflight, setup-dns, setup-certmanager]
+    if: always()
+    
+    steps:
+      - name: Wait for DNS Propagation
+        if: github.event.inputs.action != 'verify-only'
+        run: |
+          echo "Waiting 60 seconds for DNS propagation..."
+          sleep 60
+
+      - name: Comprehensive HTTPS Verification
+        run: |
+          echo "## ✅ HTTPS Endpoint Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          ENVS="${{ github.event.inputs.environment }}"
+          [ "$ENVS" = "all" ] && ENVS="dev qa"
+          
+          ALL_PASS=true
+          
+          for ENV in $ENVS; do
+            if [ "$ENV" = "dev" ]; then
+              HOSTNAME="${{ env.DEV_HOST }}"
+            else
+              HOSTNAME="${{ env.QA_HOST }}"
+            fi
+            
+            echo "### ${ENV^^} Environment" >> $GITHUB_STEP_SUMMARY
+            echo "**URL:** \`https://${HOSTNAME}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Check | Result | Details |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+            
+            # DNS Resolution
+            DNS_IP=$(dig +short ${HOSTNAME} | head -1)
+            if [ -n "$DNS_IP" ]; then
+              echo "| DNS Resolution | ✅ Pass | \`${DNS_IP}\` |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| DNS Resolution | ❌ Fail | No record found |" >> $GITHUB_STEP_SUMMARY
+              ALL_PASS=false
+            fi
+            
+            # HTTPS Connection
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "https://${HOSTNAME}/" 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "| HTTPS Connection | ✅ Pass | HTTP ${HTTP_STATUS} |" >> $GITHUB_STEP_SUMMARY
+            elif [ "$HTTP_STATUS" = "301" ] || [ "$HTTP_STATUS" = "302" ]; then
+              echo "| HTTPS Connection | ✅ Pass | HTTP ${HTTP_STATUS} (redirect) |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| HTTPS Connection | ❌ Fail | HTTP ${HTTP_STATUS} |" >> $GITHUB_STEP_SUMMARY
+              ALL_PASS=false
+            fi
+            
+            # TLS Certificate
+            CERT_INFO=$(echo | openssl s_client -servername ${HOSTNAME} -connect ${HOSTNAME}:443 2>/dev/null | openssl x509 -noout -subject -dates 2>/dev/null || echo "")
+            if [ -n "$CERT_INFO" ]; then
+              CERT_CN=$(echo "$CERT_INFO" | grep subject | sed 's/.*CN = //')
+              CERT_EXPIRY=$(echo "$CERT_INFO" | grep notAfter | cut -d= -f2)
+              echo "| TLS Certificate | ✅ Valid | CN=\`${CERT_CN}\`, Expires: ${CERT_EXPIRY} |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| TLS Certificate | ❌ Fail | Could not retrieve certificate |" >> $GITHUB_STEP_SUMMARY
+              ALL_PASS=false
+            fi
+            
+            # SSL Redirect
+            HTTP_REDIRECT=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "http://${HOSTNAME}/" 2>/dev/null || echo "000")
+            if [ "$HTTP_REDIRECT" = "301" ] || [ "$HTTP_REDIRECT" = "308" ]; then
+              echo "| SSL Redirect | ✅ Pass | HTTP → HTTPS (${HTTP_REDIRECT}) |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| SSL Redirect | ⚠️ Check | HTTP ${HTTP_REDIRECT} |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          # Final Summary
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$ALL_PASS" = "true" ]; then
+            echo "### 🎉 All HTTPS endpoints are working!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Environment | URL |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------------|-----|" >> $GITHUB_STEP_SUMMARY
+            echo "| DEV | [https://${{ env.DEV_HOST }}](https://${{ env.DEV_HOST }}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| QA | [https://${{ env.QA_HOST }}](https://${{ env.QA_HOST }}) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Some checks failed - review above" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
