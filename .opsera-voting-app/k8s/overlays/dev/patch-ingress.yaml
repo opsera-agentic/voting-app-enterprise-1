@@ -10,10 +10,10 @@ spec:
   ingressClassName: nginx
   tls:
   - hosts:
-    - PLACEHOLDER_SUBDOMAIN
+    - opsera-voting-app-dev.agent.opsera.dev
     secretName: voting-app-dev-tls
   rules:
-  - host: PLACEHOLDER_SUBDOMAIN
+  - host: opsera-voting-app-dev.agent.opsera.dev
     http:
       paths:
       - path: /

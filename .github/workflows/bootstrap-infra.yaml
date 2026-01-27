@@ -113,76 +113,12 @@ jobs:
           fi
 
   # ============================================
-  # STAGE 2: Update Configuration Files
-  # ============================================
-  update-config:
-    name: "Update Configuration Files"
-    runs-on: ubuntu-latest
-    needs: [verify-prerequisites]
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: Update Ingress Subdomain
-        env:
-          SUBDOMAIN: ${{ needs.verify-prerequisites.outputs.subdomain }}
-          ECR_URI: ${{ needs.verify-prerequisites.outputs.ecr_uri }}
-        run: |
-          # Pull latest changes
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main || true
-
-          # Update ingress subdomain (RULE 29)
-          INGRESS_FILE=".opsera-${{ env.APP_NAME }}/k8s/overlays/${{ env.ENVIRONMENT }}/patch-ingress.yaml"
-          if [ -f "$INGRESS_FILE" ]; then
-            sed -i "s|PLACEHOLDER_SUBDOMAIN|${SUBDOMAIN}|g" "$INGRESS_FILE"
-            echo "Updated ingress subdomain to: ${SUBDOMAIN}"
-          fi
-
-          # Update base ingress too
-          BASE_INGRESS=".opsera-${{ env.APP_NAME }}/k8s/base/ingress.yaml"
-          if [ -f "$BASE_INGRESS" ]; then
-            sed -i "s|PLACEHOLDER_SUBDOMAIN|${SUBDOMAIN}|g" "$BASE_INGRESS"
-          fi
-
-          # Update ECR URI in kustomization
-          KUSTOMIZE_FILE=".opsera-${{ env.APP_NAME }}/k8s/overlays/${{ env.ENVIRONMENT }}/kustomization.yaml"
-          if [ -f "$KUSTOMIZE_FILE" ]; then
-            sed -i "s|PLACEHOLDER_ECR_URI|${ECR_URI}|g" "$KUSTOMIZE_FILE"
-          fi
-
-          BASE_KUSTOMIZE=".opsera-${{ env.APP_NAME }}/k8s/base/kustomization.yaml"
-          if [ -f "$BASE_KUSTOMIZE" ]; then
-            sed -i "s|PLACEHOLDER_ECR_URI|${ECR_URI}|g" "$BASE_KUSTOMIZE"
-          fi
-
-          # Update ArgoCD application with correct environment (RULE 21)
-          APP_MANIFEST=".opsera-${{ env.APP_NAME }}/argocd/application.yaml"
-          if [ -f "$APP_MANIFEST" ]; then
-            REPO_URL="${{ github.server_url }}/${{ github.repository }}.git"
-            sed -i "s|name: ${{ env.APP_NAME }}-.*|name: ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}|" "$APP_MANIFEST"
-            sed -i "s|environment: .*|environment: ${{ env.ENVIRONMENT }}|" "$APP_MANIFEST"
-            sed -i "s|path: .opsera-${{ env.APP_NAME }}/k8s/overlays/.*|path: .opsera-${{ env.APP_NAME }}/k8s/overlays/${{ env.ENVIRONMENT }}|" "$APP_MANIFEST"
-            sed -i "s|namespace: ${{ env.APP_NAME }}-.*|namespace: ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}|" "$APP_MANIFEST"
-            sed -i "s|repoURL: .*|repoURL: ${REPO_URL}|" "$APP_MANIFEST"
-            echo "Updated ArgoCD application for environment: ${{ env.ENVIRONMENT }}"
-          fi
-
-          # Commit changes
-          git add .
-          git commit -m "chore: configure for ${{ env.ENVIRONMENT }} deployment [skip ci]" || echo "No changes"
-          git push origin main
-
-  # ============================================
-  # STAGE 3: Setup ArgoCD Repository Secret
+  # STAGE 2: Setup ArgoCD Repository Secret
   # ============================================
   setup-argocd:
     name: "Setup ArgoCD"
     runs-on: ubuntu-latest
-    needs: [verify-prerequisites, update-config]
+    needs: [verify-prerequisites]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

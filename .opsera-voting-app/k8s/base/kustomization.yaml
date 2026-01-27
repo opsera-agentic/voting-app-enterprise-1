@@ -29,11 +29,11 @@ commonLabels:
 
 images:
   - name: vote
-    newName: PLACEHOLDER_ECR_URI/vote
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/vote
     newTag: latest
   - name: result
-    newName: PLACEHOLDER_ECR_URI/result
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/result
     newTag: latest
   - name: worker
-    newName: PLACEHOLDER_ECR_URI/worker
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/worker
     newTag: latest
