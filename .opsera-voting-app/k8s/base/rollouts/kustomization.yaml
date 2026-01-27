@@ -7,6 +7,8 @@ metadata:
 resources:
   - vote-rollout.yaml
   - result-rollout.yaml
+  - vote-canary-service.yaml
+  - result-canary-service.yaml
   - analysis-template.yaml
   - analysis-template-http.yaml  # Fallback when Prometheus is not available
 

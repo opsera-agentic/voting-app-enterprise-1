@@ -129,10 +129,13 @@ jobs:
                 LAST_SYNC_FORMATTED="Never"
               fi
               
-              # Get image tag from kustomization
+              # Get image tag from kustomization (newTag is 2 lines after name:)
               OVERLAY_PATH=".opsera-voting-app/k8s/overlays/${ENV}/kustomization.yaml"
               if [ -f "$OVERLAY_PATH" ]; then
-                IMAGE_TAG=$(grep -A1 "name: vote" "$OVERLAY_PATH" | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' ' || echo "Unknown")
+                IMAGE_TAG=$(grep -A2 "name: vote$" "$OVERLAY_PATH" | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' "' || echo "")
+                if [ -z "$IMAGE_TAG" ]; then
+                  IMAGE_TAG="N/A"
+                fi
               else
                 IMAGE_TAG="N/A"
               fi
@@ -216,9 +219,13 @@ jobs:
             for ENV in dev qa staging prod; do
               OVERLAY_PATH=".opsera-voting-app/k8s/overlays/${ENV}/kustomization.yaml"
               if [ -f "$OVERLAY_PATH" ]; then
-                TAG=$(grep -A1 "name: ${SERVICE}" "$OVERLAY_PATH" | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' ' || echo "-")
-                if [ -n "$TAG" ] && [ "$TAG" != "-" ]; then
-                  # Shorten tag for display
+                # Extract tag using grep -A2 (newTag is 2 lines after name:)
+                TAG=$(grep -A2 "name: ${SERVICE}$" "$OVERLAY_PATH" | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' "' || echo "")
+                if [ -z "$TAG" ]; then
+                  TAG="-"
+                fi
+                if [ "$TAG" != "-" ]; then
+                  # Shorten tag for display (first 15 chars)
                   SHORT_TAG=$(echo "$TAG" | cut -c1-15)
                   ROW="${ROW} \`${SHORT_TAG}\` |"
                 else
@@ -289,19 +296,22 @@ jobs:
           
           # Check if namespace exists
           if kubectl get namespace "${NAMESPACE}" &>/dev/null; then
-            echo "| Rollout | Phase | Current Step | Canary Weight | Stable | Canary |" >> $GITHUB_STEP_SUMMARY
-            echo "|---------|-------|--------------|---------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Rollout | Phase | Step | Message | Replicas (Ready/Desired) |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|-------|------|---------|--------------------------|" >> $GITHUB_STEP_SUMMARY
             
             for ROLLOUT in vote-rollout result-rollout; do
               if kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" &>/dev/null; then
-                PHASE=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-                STEP=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.currentStepIndex}' 2>/dev/null || echo "-")
-                TOTAL_STEPS=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.spec.strategy.canary.steps}' 2>/dev/null | jq 'length' || echo "-")
-                STABLE_RS=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "-")
-                CANARY_RS=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.canary.currentStepAnalysisRunStatus}' 2>/dev/null || echo "-")
+                # Get rollout status in JSON format
+                ROLLOUT_JSON=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o json 2>/dev/null)
                 
-                # Get canary weight if available
-                WEIGHT=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.canary.weights.canary.weight}' 2>/dev/null || echo "0")
+                PHASE=$(echo "$ROLLOUT_JSON" | jq -r '.status.phase // "Unknown"')
+                MESSAGE=$(echo "$ROLLOUT_JSON" | jq -r '.status.message // ""' | head -c 40)
+                REPLICAS=$(echo "$ROLLOUT_JSON" | jq -r '.status.replicas // 0')
+                READY=$(echo "$ROLLOUT_JSON" | jq -r '.status.readyReplicas // 0')
+                STEP_INDEX=$(echo "$ROLLOUT_JSON" | jq -r '.status.currentStepIndex // 0')
+                
+                # Count total steps
+                TOTAL_STEPS=$(echo "$ROLLOUT_JSON" | jq -r '.spec.strategy.canary.steps | length // 0')
                 
                 case "$PHASE" in
                   "Healthy") PHASE_EMOJI="🟢" ;;
@@ -311,11 +321,14 @@ jobs:
                   *) PHASE_EMOJI="⚪" ;;
                 esac
                 
-                STABLE_SHORT="${STABLE_RS:0:10}"
+                # Truncate message for display
+                if [ ${#MESSAGE} -gt 35 ]; then
+                  MESSAGE="${MESSAGE:0:35}..."
+                fi
                 
-                echo "| ${ROLLOUT} | ${PHASE_EMOJI} ${PHASE} | ${STEP}/${TOTAL_STEPS} | ${WEIGHT}% | \`${STABLE_SHORT}\` | - |" >> $GITHUB_STEP_SUMMARY
+                echo "| ${ROLLOUT} | ${PHASE_EMOJI} ${PHASE} | ${STEP_INDEX}/${TOTAL_STEPS} | ${MESSAGE:-N/A} | ${READY}/${REPLICAS} |" >> $GITHUB_STEP_SUMMARY
               else
-                echo "| ${ROLLOUT} | ⚪ Not Found | - | - | - | - |" >> $GITHUB_STEP_SUMMARY
+                echo "| ${ROLLOUT} | ⚪ Not Found | - | - | - |" >> $GITHUB_STEP_SUMMARY
               fi
             done
           else

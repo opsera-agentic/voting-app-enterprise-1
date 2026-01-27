@@ -65,6 +65,10 @@ spec:
             - ALL
   strategy:
     canary:
+      # Required services for traffic routing
+      stableService: vote
+      canaryService: vote-canary
+
       # Canary traffic shifting: 10% -> 30% -> 60% -> 100%
       steps:
       - setWeight: 10

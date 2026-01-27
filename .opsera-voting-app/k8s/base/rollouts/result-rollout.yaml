@@ -57,6 +57,11 @@ spec:
             - ALL
   strategy:
     canary:
+      # Required services for traffic routing
+      stableService: result
+      canaryService: result-canary
+
+      # Canary traffic shifting steps
       steps:
       - setWeight: 10
       - pause: {duration: 2m}
@@ -65,6 +70,8 @@ spec:
       - setWeight: 60
       - pause: {duration: 2m}
       - setWeight: 100
+
+      # Analysis template for automated rollback
       analysis:
         templates:
         - templateName: success-rate
@@ -72,7 +79,9 @@ spec:
         args:
         - name: service-name
           value: result
+
+      # Traffic routing with NGINX Ingress
       trafficRouting:
         nginx:
-          stableIngress: voting-app
+          stableIngress: voting-app-result
           annotationPrefix: nginx.ingress.kubernetes.io
