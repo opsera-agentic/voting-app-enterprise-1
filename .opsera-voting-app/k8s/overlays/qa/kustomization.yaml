@@ -58,11 +58,11 @@ patches:
 
 images:
   - name: vote
-    newName: PLACEHOLDER_ECR_URI/vote
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/vote
+    newTag: b559ea7-20260127055434
   - name: result
-    newName: PLACEHOLDER_ECR_URI/result
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/result
+    newTag: b559ea7-20260127055434
   - name: worker
-    newName: PLACEHOLDER_ECR_URI/worker
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/worker
+    newTag: b559ea7-20260127055434
