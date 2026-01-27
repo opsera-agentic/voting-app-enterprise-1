@@ -51,37 +51,35 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           for ROLLOUT in vote-rollout result-rollout; do
+            echo "========================================="
+            echo "ROLLOUT: ${ROLLOUT}"
+            echo "========================================="
+            
             echo "### ${ROLLOUT}" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
             if kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" &>/dev/null; then
-              # Get full status
-              echo "**Status:**" >> $GITHUB_STEP_SUMMARY
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status}' | jq '.' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "Unable to get status"
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
+              # Output to both log and summary
+              echo "--- STATUS ---"
+              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status}' | jq '.'
               
-              # Get conditions
-              echo "**Conditions:**" >> $GITHUB_STEP_SUMMARY
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.conditions}' | jq '.' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No conditions"
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "--- CONDITIONS ---"
+              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.conditions}' | jq '.'
               
-              # Get strategy config
-              echo "**Strategy Config:**" >> $GITHUB_STEP_SUMMARY
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.spec.strategy.canary}' | jq '.' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No canary config"
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "--- CANARY CONFIG ---"
+              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.spec.strategy.canary}' | jq '.'
               
               # Describe for events
-              echo "**Events:**" >> $GITHUB_STEP_SUMMARY
-              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              kubectl describe rollout "${ROLLOUT}" -n "${NAMESPACE}" | grep -A 20 "Events:" >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No events"
+              echo "--- DESCRIBE ---"
+              kubectl describe rollout "${ROLLOUT}" -n "${NAMESPACE}" | tail -30
+              
+              # Write to summary
+              echo "**Status:**" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+              kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status}' | jq '.' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "Unable to get status"
               echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             else
+              echo "Rollout ${ROLLOUT} not found in namespace ${NAMESPACE}"
               echo "Rollout not found" >> $GITHUB_STEP_SUMMARY
             fi
             
