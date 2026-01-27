@@ -33,11 +33,6 @@ permissions:
   contents: write
   id-token: write
 
-outputs:
-  image_tag:
-    description: "The image tag for built images"
-    value: ${{ jobs.prepare.outputs.image_tag }}
-
 jobs:
   # ┌──────────────────────────────────────────────────────────────────────────────┐
   # │ PREPARE: Generate build metadata                                             │
