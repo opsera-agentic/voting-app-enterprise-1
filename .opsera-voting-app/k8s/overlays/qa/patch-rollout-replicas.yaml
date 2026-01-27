@@ -17,14 +17,16 @@ spec:
       - setWeight: 60
       - pause: {duration: 2m}
       - setWeight: 100
-      # Analysis template for automated rollback
+      # Analysis template for automated rollback (HTTP-based, no Prometheus required)
       analysis:
         templates:
-        - templateName: success-rate
+        - templateName: http-health-check
         startingStep: 1
         args:
         - name: service-name
           value: vote
+        - name: namespace
+          value: voting-app-qa
       # Traffic routing with NGINX Ingress
       trafficRouting:
         nginx:
@@ -49,11 +51,13 @@ spec:
       - setWeight: 100
       analysis:
         templates:
-        - templateName: success-rate
+        - templateName: http-health-check
         startingStep: 1
         args:
         - name: service-name
           value: result
+        - name: namespace
+          value: voting-app-qa
       trafficRouting:
         nginx:
           stableIngress: voting-app-result
