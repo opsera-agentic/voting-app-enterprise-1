@@ -12,6 +12,10 @@ resources:
   - analysis-template.yaml
   - analysis-template-http.yaml  # Fallback when Prometheus is not available
 
-commonLabels:
-  app.kubernetes.io/part-of: voting-app
-  deployment-strategy: canary
+# Use labels transformer to avoid modifying selectors
+# commonLabels adds to both metadata AND selectors, which breaks Argo Rollouts
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: voting-app
+      deployment-strategy: canary
+    includeSelectors: false
