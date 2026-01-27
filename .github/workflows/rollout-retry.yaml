@@ -1,0 +1,139 @@
+name: "Retry Rollouts"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - qa
+      rollout:
+        description: 'Rollout to retry (or "all")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - vote-rollout
+          - result-rollout
+
+env:
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+  APP_NAME: voting-app
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  retry:
+    name: "Retry Rollouts - ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          # Install Argo Rollouts kubectl plugin
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Connect to Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Retry Rollouts
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          ROLLOUT="${{ github.event.inputs.rollout }}"
+          
+          echo "## 🔄 Rollout Retry" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$ROLLOUT" = "all" ]; then
+            ROLLOUTS="vote-rollout result-rollout"
+          else
+            ROLLOUTS="$ROLLOUT"
+          fi
+          
+          for R in $ROLLOUTS; do
+            echo "### Retrying ${R}..." >> $GITHUB_STEP_SUMMARY
+            echo "Retrying ${R}..."
+            
+            # Check current status
+            PHASE=$(kubectl get rollout "${R}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            echo "Current phase: ${PHASE}"
+            
+            if [ "$PHASE" = "Degraded" ]; then
+              # Retry the rollout
+              kubectl-argo-rollouts retry rollout "${R}" -n "${NAMESPACE}"
+              echo "✅ Retry initiated for ${R}" >> $GITHUB_STEP_SUMMARY
+            elif [ "$PHASE" = "Paused" ]; then
+              # Promote the rollout
+              kubectl-argo-rollouts promote "${R}" -n "${NAMESPACE}"
+              echo "✅ Promoted ${R}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "ℹ️ ${R} is in phase: ${PHASE}, no action needed" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Wait and Check Status
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "Waiting 30 seconds for rollouts to progress..."
+          sleep 30
+          
+          echo "## 📊 Rollout Status After Retry" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Rollout | Phase | Ready | Message |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|-------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout result-rollout; do
+            if kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" &>/dev/null; then
+              PHASE=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}')
+              READY=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}')
+              REPLICAS=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.replicas}')
+              MESSAGE=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.message}' | head -c 40)
+              
+              case "$PHASE" in
+                "Healthy") EMOJI="🟢" ;;
+                "Progressing") EMOJI="🔵" ;;
+                "Paused") EMOJI="⏸️" ;;
+                "Degraded") EMOJI="🔴" ;;
+                *) EMOJI="⚪" ;;
+              esac
+              
+              echo "| ${ROLLOUT} | ${EMOJI} ${PHASE} | ${READY:-0}/${REPLICAS:-0} | ${MESSAGE:-OK} |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Show Pods
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "## 🏃 Pod Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n "${NAMESPACE}" -o wide >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

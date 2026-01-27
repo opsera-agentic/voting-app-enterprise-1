@@ -1,4 +1,5 @@
-# Patch for main vote ingress - QA environment with canary support
+# Stable ingress for vote app - QA environment
+# Argo Rollouts will manage canary annotations automatically
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -7,9 +8,8 @@ metadata:
     environment: qa
   annotations:
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    # Canary annotations for Argo Rollouts traffic splitting
-    nginx.ingress.kubernetes.io/canary: "true"
-    nginx.ingress.kubernetes.io/canary-weight: "0"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
 spec:
   ingressClassName: nginx
   tls:

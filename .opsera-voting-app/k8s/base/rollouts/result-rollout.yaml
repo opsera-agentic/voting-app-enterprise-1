@@ -71,14 +71,15 @@ spec:
       - pause: {duration: 2m}
       - setWeight: 100
 
-      # Analysis template for automated rollback
-      analysis:
-        templates:
-        - templateName: success-rate
-        startingStep: 1
-        args:
-        - name: service-name
-          value: result
+      # Analysis template disabled until Prometheus metrics are available
+      # Uncomment when prometheus has nginx_ingress_controller_requests metric
+      # analysis:
+      #   templates:
+      #   - templateName: success-rate
+      #   startingStep: 1
+      #   args:
+      #   - name: service-name
+      #     value: result
 
       # Traffic routing with NGINX Ingress
       trafficRouting:
