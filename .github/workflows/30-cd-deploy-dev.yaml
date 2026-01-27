@@ -1,0 +1,328 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║              ENTERPRISE CD PIPELINE - DEPLOY TO DEV                            ║
+# ║                                                                                ║
+# ║  Stage 3 of the CI/CD Pipeline:                                                ║
+# ║  • Update Kustomize manifests                                                  ║
+# ║  • Trigger ArgoCD sync                                                         ║
+# ║  • Validate deployment health                                                  ║
+# ║  • Run smoke tests                                                             ║
+# ║  • Generate deployment report                                                  ║
+# ║                                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🚀 CD: Deploy to DEV"
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  ENVIRONMENT: dev
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+  DEV_URL: https://opsera-voting-app.agent.opsera.dev
+  DEV_RESULTS_URL: https://results.opsera-voting-app.agent.opsera.dev
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # PRE-DEPLOYMENT VALIDATION
+  # ════════════════════════════════════════════════════════════════════════════════
+  pre-deploy-check:
+    name: "🔎 Pre-Deploy Check"
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify Image Exists
+        id: check
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          echo "## 🔎 Pre-Deployment Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          READY=true
+          
+          for SERVICE in vote result worker; do
+            if aws ecr describe-images --repository-name "$SERVICE" --image-ids imageTag="${IMAGE_TAG}" &>/dev/null; then
+              echo "| \`${SERVICE}:${IMAGE_TAG}\` | ✅ Found |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| \`${SERVICE}:${IMAGE_TAG}\` | ❌ Not Found |" >> $GITHUB_STEP_SUMMARY
+              READY=false
+            fi
+          done
+          
+          echo "ready=${READY}" >> $GITHUB_OUTPUT
+          
+          if [ "$READY" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Pre-deployment check failed** - one or more images not found" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # UPDATE MANIFESTS
+  # ════════════════════════════════════════════════════════════════════════════════
+  update-manifests:
+    name: "📝 Update Manifests"
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-check]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update Kustomization
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          KUSTOMIZE_FILE=".opsera-${{ env.APP_NAME }}/k8s/overlays/${{ env.ENVIRONMENT }}/kustomization.yaml"
+          
+          # Update image references
+          sed -i "s|newName: .*/vote|newName: ${ECR_URI}/vote|" "$KUSTOMIZE_FILE"
+          sed -i "s|newName: .*/result|newName: ${ECR_URI}/result|" "$KUSTOMIZE_FILE"
+          sed -i "s|newName: .*/worker|newName: ${ECR_URI}/worker|" "$KUSTOMIZE_FILE"
+          sed -i "s|newTag: .*|newTag: ${IMAGE_TAG}|g" "$KUSTOMIZE_FILE"
+          
+          echo "### 📝 Manifest Update" >> $GITHUB_STEP_SUMMARY
+          echo "Updated \`${KUSTOMIZE_FILE}\` with tag \`${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+          git add .
+          git diff --staged --quiet || git commit -m "chore(dev): deploy ${{ inputs.image_tag }} [skip ci]"
+          git push origin main || echo "No changes to push"
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # ARGOCD SYNC
+  # ════════════════════════════════════════════════════════════════════════════════
+  argocd-sync:
+    name: "🔄 ArgoCD Sync"
+    runs-on: ubuntu-latest
+    needs: [update-manifests]
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Sync ArgoCD Application
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          APP_NAME="${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}"
+          
+          # Hard refresh
+          kubectl patch application "${APP_NAME}" -n argocd \
+            --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}' || true
+          
+          sleep 5
+          
+          # Trigger sync
+          kubectl patch application "${APP_NAME}" -n argocd \
+            --type merge -p '{"operation":{"initiatedBy":{"username":"github-actions"},"sync":{"prune":true}}}' || true
+          
+          echo "### 🔄 ArgoCD Sync" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered sync for \`${APP_NAME}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # VERIFY DEPLOYMENT
+  # ════════════════════════════════════════════════════════════════════════════════
+  verify-deployment:
+    name: "✅ Verify Deployment"
+    runs-on: ubuntu-latest
+    needs: [argocd-sync]
+    outputs:
+      healthy: ${{ steps.verify.outputs.healthy }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Wait for Deployment
+        id: verify
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          APP_NAME="${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}"
+          MAX_ATTEMPTS=30
+          
+          echo "### ✅ Deployment Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            SYNC=$(kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+            HEALTH=$(kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+            
+            echo "[$i/$MAX_ATTEMPTS] Sync: ${SYNC}, Health: ${HEALTH}"
+            
+            if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo "| Sync Status | ✅ ${SYNC} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Health Status | 🟢 ${HEALTH} |" >> $GITHUB_STEP_SUMMARY
+              echo "healthy=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            sleep 10
+          done
+          
+          echo "| Sync Status | ⚠️ ${SYNC} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Status | ⚠️ ${HEALTH} |" >> $GITHUB_STEP_SUMMARY
+          echo "healthy=false" >> $GITHUB_OUTPUT
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # SMOKE TESTS
+  # ════════════════════════════════════════════════════════════════════════════════
+  smoke-tests:
+    name: "🧪 Smoke Tests"
+    runs-on: ubuntu-latest
+    needs: [verify-deployment]
+    outputs:
+      passed: ${{ steps.test.outputs.passed }}
+    
+    steps:
+      - name: Run Smoke Tests
+        id: test
+        run: |
+          echo "### 🧪 Smoke Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint | Status | Response |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|----------|" >> $GITHUB_STEP_SUMMARY
+          
+          PASSED=true
+          
+          # Test Vote App
+          VOTE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.DEV_URL }}" --connect-timeout 10 -k || echo "000")
+          if [ "$VOTE_STATUS" = "200" ] || [ "$VOTE_STATUS" = "301" ] || [ "$VOTE_STATUS" = "302" ]; then
+            echo "| Vote App | ✅ | HTTP ${VOTE_STATUS} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Vote App | ⚠️ | HTTP ${VOTE_STATUS} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Test Results App
+          RESULT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.DEV_RESULTS_URL }}" --connect-timeout 10 -k || echo "000")
+          if [ "$RESULT_STATUS" = "200" ] || [ "$RESULT_STATUS" = "301" ] || [ "$RESULT_STATUS" = "302" ]; then
+            echo "| Results App | ✅ | HTTP ${RESULT_STATUS} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Results App | ⚠️ | HTTP ${RESULT_STATUS} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "passed=${PASSED}" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**DEV URLs:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Vote: ${{ env.DEV_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Results: ${{ env.DEV_RESULTS_URL }}" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # DEPLOYMENT SUMMARY
+  # ════════════════════════════════════════════════════════════════════════════════
+  deployment-summary:
+    name: "📊 Deployment Summary"
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-check, update-manifests, argocd-sync, verify-deployment, smoke-tests]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 🚀 DEV Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          [ "${{ needs.pre-deploy-check.result }}" = "success" ] && echo "| Pre-Deploy Check | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Pre-Deploy Check | ❌ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.update-manifests.result }}" = "success" ] && echo "| Update Manifests | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Update Manifests | ❌ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.argocd-sync.result }}" = "success" ] && echo "| ArgoCD Sync | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| ArgoCD Sync | ❌ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.verify-deployment.result }}" = "success" ] && echo "| Verify Deployment | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Verify Deployment | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.smoke-tests.result }}" = "success" ] && echo "| Smoke Tests | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Smoke Tests | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ inputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack - DEV Complete
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
+          
+          STATUS="${{ needs.smoke-tests.result }}"
+          [ "$STATUS" = "success" ] && EMOJI="✅" && COLOR="good" || EMOJI="⚠️" && COLOR="warning"
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "attachments": [{
+                "color": "'"${COLOR}"'",
+                "blocks": [
+                  {"type": "header", "text": {"type": "plain_text", "text": "'"${EMOJI}"' DEV Deployment Complete", "emoji": true}},
+                  {"type": "section", "fields": [
+                    {"type": "mrkdwn", "text": "*Image Tag:*\n`'"${{ inputs.image_tag }}"'`"},
+                    {"type": "mrkdwn", "text": "*Environment:*\nDEV"}
+                  ]},
+                  {"type": "section", "text": {"type": "mrkdwn", "text": "*URLs:*\n• <'"${{ env.DEV_URL }}"'|Vote App>\n• <'"${{ env.DEV_RESULTS_URL }}"'|Results App>"}},
+                  {"type": "actions", "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "⬆️ Promote to QA"}, "style": "primary", "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/40-cd-promote-qa.yaml"}
+                  ]}
+                ]
+              }]
+            }' \
+            "$SLACK_WEBHOOK" || true

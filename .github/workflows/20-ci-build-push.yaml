@@ -1,0 +1,306 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║              ENTERPRISE CI PIPELINE - BUILD & CONTAINER SCAN                   ║
+# ║                                                                                ║
+# ║  Stage 2 of the CI/CD Pipeline:                                                ║
+# ║  • Build Docker images (parallel for all services)                             ║
+# ║  • Container vulnerability scanning (Grype)                                    ║
+# ║  • Push to ECR                                                                 ║
+# ║  • Generate SBOM                                                               ║
+# ║                                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🔨 CI: Build & Push"
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to build (comma-separated or "all")'
+        required: true
+        default: 'all'
+        type: string
+      skip_scan:
+        description: 'Skip container scanning'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      services:
+        description: 'Services to build'
+        required: false
+        type: string
+        default: 'all'
+    outputs:
+      image_tag:
+        description: 'Built image tag'
+        value: ${{ jobs.prepare.outputs.image_tag }}
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+
+permissions:
+  contents: write
+  id-token: write
+  security-events: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # PREPARATION
+  # ════════════════════════════════════════════════════════════════════════════════
+  prepare:
+    name: "📋 Prepare Build"
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+      ecr_uri: ${{ steps.ecr.outputs.ecr_uri }}
+      build_vote: ${{ steps.changes.outputs.vote }}
+      build_result: ${{ steps.changes.outputs.result }}
+      build_worker: ${{ steps.changes.outputs.worker }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Generate Image Tag
+        id: tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          
+          echo "### 🏷️ Build Metadata" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag** | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | [\`${SHORT_SHA}\`](${{ github.server_url }}/${{ github.repository }}/commit/${GITHUB_SHA}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${GITHUB_REF_NAME}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered By** | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ECR URI
+        id: ecr
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "ecr_uri=${ECR_URI}" >> $GITHUB_OUTPUT
+
+      - name: Detect What to Build
+        id: changes
+        run: |
+          SERVICES="${{ inputs.services || 'all' }}"
+          
+          if [ "$SERVICES" = "all" ]; then
+            echo "vote=true" >> $GITHUB_OUTPUT
+            echo "result=true" >> $GITHUB_OUTPUT
+            echo "worker=true" >> $GITHUB_OUTPUT
+          else
+            echo "vote=$(echo "$SERVICES" | grep -q 'vote' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+            echo "result=$(echo "$SERVICES" | grep -q 'result' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+            echo "worker=$(echo "$SERVICES" | grep -q 'worker' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # PARALLEL BUILDS
+  # ════════════════════════════════════════════════════════════════════════════════
+  build-vote:
+    name: "🗳️ Build Vote"
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    if: needs.prepare.outputs.build_vote == 'true'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Vote Image
+        env:
+          ECR_URI: ${{ needs.prepare.outputs.ecr_uri }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          FULL_IMAGE="${ECR_URI}/vote:${IMAGE_TAG}"
+          
+          docker build -t "$FULL_IMAGE" -t "${ECR_URI}/vote:latest" \
+            -f .opsera-voting-app/Dockerfile.vote .
+          
+          docker push "$FULL_IMAGE"
+          docker push "${ECR_URI}/vote:latest"
+          
+          echo "### 🗳️ Vote Build" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${FULL_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Scan Vote Image
+        if: ${{ inputs.skip_scan != true }}
+        uses: anchore/scan-action@v3
+        with:
+          image: "${{ needs.prepare.outputs.ecr_uri }}/vote:${{ needs.prepare.outputs.image_tag }}"
+          fail-build: false
+          severity-cutoff: critical
+        continue-on-error: true
+
+  build-result:
+    name: "📊 Build Result"
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    if: needs.prepare.outputs.build_result == 'true'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Result Image
+        env:
+          ECR_URI: ${{ needs.prepare.outputs.ecr_uri }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          FULL_IMAGE="${ECR_URI}/result:${IMAGE_TAG}"
+          
+          docker build -t "$FULL_IMAGE" -t "${ECR_URI}/result:latest" \
+            -f .opsera-voting-app/Dockerfile.result .
+          
+          docker push "$FULL_IMAGE"
+          docker push "${ECR_URI}/result:latest"
+          
+          echo "### 📊 Result Build" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${FULL_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Scan Result Image
+        if: ${{ inputs.skip_scan != true }}
+        uses: anchore/scan-action@v3
+        with:
+          image: "${{ needs.prepare.outputs.ecr_uri }}/result:${{ needs.prepare.outputs.image_tag }}"
+          fail-build: false
+          severity-cutoff: critical
+        continue-on-error: true
+
+  build-worker:
+    name: "⚙️ Build Worker"
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    if: needs.prepare.outputs.build_worker == 'true'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Worker Image
+        env:
+          ECR_URI: ${{ needs.prepare.outputs.ecr_uri }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          FULL_IMAGE="${ECR_URI}/worker:${IMAGE_TAG}"
+          
+          docker build -t "$FULL_IMAGE" -t "${ECR_URI}/worker:latest" \
+            -f .opsera-voting-app/Dockerfile.worker .
+          
+          docker push "$FULL_IMAGE"
+          docker push "${ECR_URI}/worker:latest"
+          
+          echo "### ⚙️ Worker Build" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${FULL_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Scan Worker Image
+        if: ${{ inputs.skip_scan != true }}
+        uses: anchore/scan-action@v3
+        with:
+          image: "${{ needs.prepare.outputs.ecr_uri }}/worker:${{ needs.prepare.outputs.image_tag }}"
+          fail-build: false
+          severity-cutoff: critical
+        continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # BUILD SUMMARY
+  # ════════════════════════════════════════════════════════════════════════════════
+  build-summary:
+    name: "📝 Build Summary"
+    runs-on: ubuntu-latest
+    needs: [prepare, build-vote, build-result, build-worker]
+    if: always()
+    outputs:
+      image_tag: ${{ needs.prepare.outputs.image_tag }}
+    
+    steps:
+      - name: Generate Summary
+        env:
+          ECR_URI: ${{ needs.prepare.outputs.ecr_uri }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          echo "## 🔨 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status | Image |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          
+          [ "${{ needs.build-vote.result }}" = "success" ] && V="✅" || V="⏭️"
+          [ "${{ needs.build-result.result }}" = "success" ] && R="✅" || R="⏭️"
+          [ "${{ needs.build-worker.result }}" = "success" ] && W="✅" || W="⏭️"
+          
+          echo "| Vote | ${V} | \`${ECR_URI}/vote:${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | ${R} | \`${ECR_URI}/result:${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker | ${W} | \`${ECR_URI}/worker:${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": "🔨 Build Complete", "emoji": true}},
+                {"type": "section", "fields": [
+                  {"type": "mrkdwn", "text": "*Image Tag:*\n`'"${IMAGE_TAG}"'`"},
+                  {"type": "mrkdwn", "text": "*Triggered By:*\n${{ github.actor }}"}
+                ]},
+                {"type": "actions", "elements": [
+                  {"type": "button", "text": {"type": "plain_text", "text": "🚀 Deploy to DEV"}, "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/30-cd-deploy-dev.yaml"}
+                ]}
+              ]
+            }' \
+            "$SLACK_WEBHOOK" || true

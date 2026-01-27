@@ -1,0 +1,412 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║     ██████╗ ██████╗ ███████╗███████╗██████╗  █████╗                           ║
+# ║    ██╔═══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗██╔══██╗                          ║
+# ║    ██║   ██║██████╔╝███████╗█████╗  ██████╔╝███████║                          ║
+# ║    ██║   ██║██╔═══╝ ╚════██║██╔══╝  ██╔══██╗██╔══██║                          ║
+# ║    ╚██████╔╝██║     ███████║███████╗██║  ██║██║  ██║                          ║
+# ║     ╚═════╝ ╚═╝     ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝                          ║
+# ║                                                                                ║
+# ║              ENTERPRISE BOOTSTRAP - IDEMPOTENT INFRASTRUCTURE                  ║
+# ║                                                                                ║
+# ║  This workflow provisions ALL infrastructure in an idempotent manner:          ║
+# ║  • AWS Resources (ECR, IAM)                                                    ║
+# ║  • Kubernetes (EKS connection, namespaces)                                     ║
+# ║  • ArgoCD (Applications, repo secrets)                                         ║
+# ║  • GitHub (Environments, branch protection)                                    ║
+# ║                                                                                ║
+# ║  Safe to run multiple times - checks before creating                           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🏗️ Bootstrap: Enterprise Infrastructure"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to bootstrap'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - all
+        default: 'all'
+      force_recreate:
+        description: 'Force recreate resources (dangerous!)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  TENANT: opsera
+  DOMAIN: agent.opsera.dev
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 1: PRE-FLIGHT CHECKS
+  # ════════════════════════════════════════════════════════════════════════════════
+  preflight:
+    name: "🔍 Pre-flight Checks"
+    runs-on: ubuntu-latest
+    outputs:
+      aws_account_id: ${{ steps.aws.outputs.account_id }}
+      ecr_uri: ${{ steps.aws.outputs.ecr_uri }}
+      hub_exists: ${{ steps.clusters.outputs.hub_exists }}
+      spoke_exists: ${{ steps.clusters.outputs.spoke_exists }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account Info
+        id: aws
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          
+          echo "account_id=${AWS_ACCOUNT_ID}" >> $GITHUB_OUTPUT
+          echo "ecr_uri=${ECR_URI}" >> $GITHUB_OUTPUT
+          
+          echo "## 🔍 Pre-flight Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| AWS Account | \`${AWS_ACCOUNT_ID}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ECR URI | \`${ECR_URI}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check EKS Clusters
+        id: clusters
+        run: |
+          # Check hub cluster
+          if aws eks describe-cluster --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }} &>/dev/null; then
+            echo "hub_exists=true" >> $GITHUB_OUTPUT
+            echo "| Hub Cluster | ✅ \`${{ env.HUB_CLUSTER }}\` exists |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "hub_exists=false" >> $GITHUB_OUTPUT
+            echo "| Hub Cluster | ❌ \`${{ env.HUB_CLUSTER }}\` not found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check spoke cluster
+          if aws eks describe-cluster --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }} &>/dev/null; then
+            echo "spoke_exists=true" >> $GITHUB_OUTPUT
+            echo "| Spoke Cluster | ✅ \`${{ env.SPOKE_CLUSTER }}\` exists |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "spoke_exists=false" >> $GITHUB_OUTPUT
+            echo "| Spoke Cluster | ❌ \`${{ env.SPOKE_CLUSTER }}\` not found |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 2: ECR REPOSITORIES (Idempotent)
+  # ════════════════════════════════════════════════════════════════════════════════
+  ecr-setup:
+    name: "📦 ECR Repositories"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR Repositories (Idempotent)
+        run: |
+          echo "## 📦 ECR Repository Setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          for SERVICE in vote result worker; do
+            if aws ecr describe-repositories --repository-names "$SERVICE" &>/dev/null; then
+              echo "| \`${SERVICE}\` | ✅ Already exists |" >> $GITHUB_STEP_SUMMARY
+            else
+              aws ecr create-repository \
+                --repository-name "$SERVICE" \
+                --image-scanning-configuration scanOnPush=true \
+                --encryption-configuration encryptionType=AES256 \
+                --image-tag-mutability MUTABLE
+              echo "| \`${SERVICE}\` | 🆕 Created |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 3: ARGOCD SETUP (Idempotent)
+  # ════════════════════════════════════════════════════════════════════════════════
+  argocd-setup:
+    name: "🔄 ArgoCD Configuration"
+    runs-on: ubuntu-latest
+    needs: [preflight, ecr-setup]
+    if: needs.preflight.outputs.hub_exists == 'true'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Hub Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Setup ArgoCD Repository Secret (Idempotent)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}.git"
+          SECRET_NAME="repo-${{ env.APP_NAME }}"
+          
+          echo "## 🔄 ArgoCD Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if kubectl get secret "$SECRET_NAME" -n argocd &>/dev/null; then
+            echo "| Repository Secret | ✅ Already exists |" >> $GITHUB_STEP_SUMMARY
+          else
+            kubectl create secret generic "$SECRET_NAME" -n argocd \
+              --from-literal=type=git \
+              --from-literal=url="$REPO_URL" \
+              --from-literal=password="$GH_PAT" \
+              --from-literal=username="git"
+            kubectl label secret "$SECRET_NAME" -n argocd argocd.argoproj.io/secret-type=repository
+            echo "| Repository Secret | 🆕 Created |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Setup ArgoCD Applications (Idempotent)
+        run: |
+          ENVS="${{ github.event.inputs.environment }}"
+          [ "$ENVS" = "all" ] && ENVS="dev qa"
+          
+          echo "| Environment | Application | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ENV in $ENVS; do
+            APP_NAME="${{ env.APP_NAME }}-${ENV}"
+            
+            if kubectl get application "$APP_NAME" -n argocd &>/dev/null; then
+              echo "| ${ENV} | \`${APP_NAME}\` | ✅ Already exists |" >> $GITHUB_STEP_SUMMARY
+            else
+              # Check if manifest exists
+              MANIFEST=".opsera-${{ env.APP_NAME }}/argocd/application-${ENV}.yaml"
+              if [ -f "$MANIFEST" ]; then
+                kubectl apply -f "$MANIFEST"
+                echo "| ${ENV} | \`${APP_NAME}\` | 🆕 Created |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "| ${ENV} | \`${APP_NAME}\` | ⚠️ Manifest not found |" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          done
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 4: KUBERNETES NAMESPACES (Idempotent)
+  # ════════════════════════════════════════════════════════════════════════════════
+  k8s-setup:
+    name: "☸️ Kubernetes Setup"
+    runs-on: ubuntu-latest
+    needs: [preflight, argocd-setup]
+    if: needs.preflight.outputs.spoke_exists == 'true'
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Spoke Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Setup Namespaces (Idempotent)
+        run: |
+          ENVS="${{ github.event.inputs.environment }}"
+          [ "$ENVS" = "all" ] && ENVS="dev qa"
+          
+          echo "## ☸️ Kubernetes Namespaces" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ENV in $ENVS; do
+            NS="${{ env.APP_NAME }}-${ENV}"
+            
+            if kubectl get namespace "$NS" &>/dev/null; then
+              echo "| \`${NS}\` | ✅ Already exists |" >> $GITHUB_STEP_SUMMARY
+            else
+              kubectl create namespace "$NS"
+              kubectl label namespace "$NS" \
+                app=${{ env.APP_NAME }} \
+                environment=${ENV} \
+                managed-by=argocd
+              echo "| \`${NS}\` | 🆕 Created |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 5: GITHUB ENVIRONMENTS (Idempotent)
+  # ════════════════════════════════════════════════════════════════════════════════
+  github-setup:
+    name: "🔧 GitHub Environments"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    
+    steps:
+      - name: Setup GitHub Environments
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          
+          echo "## 🔧 GitHub Environments" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Purpose | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Create qa-approval environment
+          gh api --method PUT "repos/${REPO}/environments/qa-approval" \
+            --input - << 'EOF' || true
+          {
+            "wait_timer": 0,
+            "deployment_branch_policy": null
+          }
+          EOF
+          echo "| \`qa-approval\` | QA Promotion Gate | ✅ Ready |" >> $GITHUB_STEP_SUMMARY
+          
+          # Create production-approval environment (for future)
+          gh api --method PUT "repos/${REPO}/environments/production-approval" \
+            --input - << 'EOF' || true
+          {
+            "wait_timer": 0,
+            "deployment_branch_policy": null
+          }
+          EOF
+          echo "| \`production-approval\` | Production Gate | ✅ Ready |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Note:** Add required reviewers via GitHub UI: Settings → Environments" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 6: VERIFICATION
+  # ════════════════════════════════════════════════════════════════════════════════
+  verify:
+    name: "✅ Verification"
+    runs-on: ubuntu-latest
+    needs: [preflight, ecr-setup, argocd-setup, k8s-setup, github-setup]
+    if: always()
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Verify All Components
+        run: |
+          echo "## ✅ Bootstrap Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # ECR
+          ECR_COUNT=$(aws ecr describe-repositories --query 'repositories[?contains(repositoryName, `vote`) || contains(repositoryName, `result`) || contains(repositoryName, `worker`)].repositoryName' --output json | jq length)
+          [ "$ECR_COUNT" -ge 3 ] && echo "| ECR Repositories | ✅ ${ECR_COUNT}/3 |" >> $GITHUB_STEP_SUMMARY || echo "| ECR Repositories | ⚠️ ${ECR_COUNT}/3 |" >> $GITHUB_STEP_SUMMARY
+          
+          # ArgoCD
+          if aws eks describe-cluster --name ${{ env.HUB_CLUSTER }} &>/dev/null; then
+            aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+            APP_COUNT=$(kubectl get applications -n argocd -o name 2>/dev/null | wc -l || echo 0)
+            echo "| ArgoCD Applications | ✅ ${APP_COUNT} found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # K8s Namespaces
+          if aws eks describe-cluster --name ${{ env.SPOKE_CLUSTER }} &>/dev/null; then
+            aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+            NS_COUNT=$(kubectl get namespaces -l app=${{ env.APP_NAME }} -o name 2>/dev/null | wc -l || echo 0)
+            echo "| K8s Namespaces | ✅ ${NS_COUNT} found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Run **🔨 CI: Build & Test** to build images" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add reviewers to GitHub environments for approval gates" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send Slack Notification
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "Slack webhook not configured"
+            exit 0
+          fi
+          
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && EMOJI="✅" && COLOR="good" || EMOJI="❌" && COLOR="danger"
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "attachments": [{
+                "color": "'"${COLOR}"'",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "'"${EMOJI}"' Bootstrap Infrastructure Complete", "emoji": true}
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {"type": "mrkdwn", "text": "*Environment:* `'"${{ github.event.inputs.environment }}"'`"},
+                      {"type": "mrkdwn", "text": "*Status:* '"${STATUS}"'"}
+                    ]
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {"type": "mrkdwn", "text": "Triggered by *${{ github.actor }}* | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"}
+                    ]
+                  }
+                ]
+              }]
+            }' \
+            "$SLACK_WEBHOOK" || true

@@ -1,0 +1,291 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║              ENTERPRISE CD PIPELINE - CANARY MONITORING                        ║
+# ║                                                                                ║
+# ║  Stage 5 of the CI/CD Pipeline:                                                ║
+# ║  • Monitor canary weight progression (10% → 30% → 60% → 100%)                  ║
+# ║  • Track rollout status and analysis runs                                      ║
+# ║  • Provide manual promote/rollback controls                                    ║
+# ║  • Generate real-time deployment dashboard                                     ║
+# ║                                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "📊 CD: Canary Monitor"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - monitor
+          - promote
+          - abort
+        default: 'monitor'
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  SPOKE_CLUSTER: opsera-usw2-np
+  NAMESPACE: voting-app-qa
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # CANARY STATUS
+  # ════════════════════════════════════════════════════════════════════════════════
+  canary-status:
+    name: "📊 Canary Status"
+    runs-on: ubuntu-latest
+    outputs:
+      vote_phase: ${{ steps.status.outputs.vote_phase }}
+      vote_weight: ${{ steps.status.outputs.vote_weight }}
+      result_phase: ${{ steps.status.outputs.result_phase }}
+      result_weight: ${{ steps.status.outputs.result_weight }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Get Canary Status
+        id: status
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "## 📊 Canary Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Summary table
+          echo "### Rollout Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Rollout | Phase | Step | Canary Weight | Stable Weight |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|------|---------------|---------------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout result-rollout; do
+            if kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} &>/dev/null; then
+              JSON=$(kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} -o json 2>/dev/null)
+              
+              PHASE=$(echo "$JSON" | jq -r '.status.phase // "Unknown"')
+              STEP_INDEX=$(echo "$JSON" | jq -r '.status.currentStepIndex // 0')
+              TOTAL_STEPS=$(echo "$JSON" | jq -r '.spec.strategy.canary.steps | length')
+              
+              CANARY_WEIGHT=$(echo "$JSON" | jq -r 'if .status.canary.weights.canary then .status.canary.weights.canary else 0 end')
+              [[ ! "$CANARY_WEIGHT" =~ ^[0-9]+$ ]] && CANARY_WEIGHT=0
+              STABLE_WEIGHT=$((100 - CANARY_WEIGHT))
+              
+              # Phase emoji
+              case "$PHASE" in
+                "Healthy") EMOJI="🟢" ;;
+                "Progressing") EMOJI="🔵" ;;
+                "Paused") EMOJI="⏸️" ;;
+                "Degraded") EMOJI="🔴" ;;
+                *) EMOJI="⚪" ;;
+              esac
+              
+              echo "| ${ROLLOUT} | ${EMOJI} ${PHASE} | ${STEP_INDEX}/${TOTAL_STEPS} | ${CANARY_WEIGHT}% | ${STABLE_WEIGHT}% |" >> $GITHUB_STEP_SUMMARY
+              
+              # Outputs
+              if [ "$ROLLOUT" = "vote-rollout" ]; then
+                echo "vote_phase=${PHASE}" >> $GITHUB_OUTPUT
+                echo "vote_weight=${CANARY_WEIGHT}" >> $GITHUB_OUTPUT
+              else
+                echo "result_phase=${PHASE}" >> $GITHUB_OUTPUT
+                echo "result_weight=${CANARY_WEIGHT}" >> $GITHUB_OUTPUT
+              fi
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Canary Progress Visualization
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "### 🐤 Canary Progress" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout result-rollout; do
+            if kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} &>/dev/null; then
+              JSON=$(kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} -o json 2>/dev/null)
+              STEP_INDEX=$(echo "$JSON" | jq -r '.status.currentStepIndex // 0')
+              TOTAL_STEPS=$(echo "$JSON" | jq -r '.spec.strategy.canary.steps | length')
+              
+              SERVICE=$(echo "$ROLLOUT" | sed 's/-rollout//')
+              echo "**${SERVICE}:**" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+              
+              PROGRESS=""
+              for i in $(seq 0 $((TOTAL_STEPS - 1))); do
+                if [ "$i" -lt "$STEP_INDEX" ]; then
+                  PROGRESS="${PROGRESS}[✅]"
+                elif [ "$i" -eq "$STEP_INDEX" ]; then
+                  PROGRESS="${PROGRESS}[▶️]"
+                else
+                  PROGRESS="${PROGRESS}[⬜]"
+                fi
+              done
+              
+              echo "$PROGRESS" >> $GITHUB_STEP_SUMMARY
+              echo "Step ${STEP_INDEX}/${TOTAL_STEPS}" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - name: Detailed Step View
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "### Step-by-Step Progression" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout; do
+            if kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} &>/dev/null; then
+              JSON=$(kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} -o json 2>/dev/null)
+              STEP_INDEX=$(echo "$JSON" | jq -r '.status.currentStepIndex // 0')
+              TOTAL_STEPS=$(echo "$JSON" | jq -r '.spec.strategy.canary.steps | length')
+              
+              echo "| Step | Action | Status |" >> $GITHUB_STEP_SUMMARY
+              echo "|------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+              
+              for i in $(seq 0 $((TOTAL_STEPS - 1))); do
+                STEP=$(echo "$JSON" | jq -r ".spec.strategy.canary.steps[$i]")
+                WEIGHT=$(echo "$STEP" | jq -r '.setWeight // empty')
+                PAUSE=$(echo "$STEP" | jq -r '.pause.duration // empty')
+                
+                if [ "$i" -lt "$STEP_INDEX" ]; then
+                  MARKER="✅ Complete"
+                elif [ "$i" -eq "$STEP_INDEX" ]; then
+                  MARKER="▶️ **Current**"
+                else
+                  MARKER="⬜ Pending"
+                fi
+                
+                STEP_NUM=$((i + 1))
+                if [ -n "$WEIGHT" ] && [ "$WEIGHT" != "null" ]; then
+                  echo "| ${STEP_NUM} | Traffic ${WEIGHT}% | ${MARKER} |" >> $GITHUB_STEP_SUMMARY
+                elif [ -n "$PAUSE" ] && [ "$PAUSE" != "null" ]; then
+                  echo "| ${STEP_NUM} | Pause ${PAUSE} | ${MARKER} |" >> $GITHUB_STEP_SUMMARY
+                fi
+              done
+            fi
+          done
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # MANUAL ACTIONS
+  # ════════════════════════════════════════════════════════════════════════════════
+  execute-action:
+    name: "⚡ Execute Action"
+    runs-on: ubuntu-latest
+    needs: [canary-status]
+    if: ${{ github.event.inputs.action != 'monitor' }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Execute Action
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          ACTION="${{ github.event.inputs.action }}"
+          
+          echo "## ⚡ Action: ${ACTION}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout result-rollout; do
+            if kubectl get rollout "${ROLLOUT}" -n ${{ env.NAMESPACE }} &>/dev/null; then
+              echo "### ${ROLLOUT}" >> $GITHUB_STEP_SUMMARY
+              
+              case "$ACTION" in
+                promote)
+                  kubectl-argo-rollouts promote "$ROLLOUT" -n ${{ env.NAMESPACE }}
+                  echo "✅ Promoted to next step" >> $GITHUB_STEP_SUMMARY
+                  ;;
+                abort)
+                  kubectl-argo-rollouts abort "$ROLLOUT" -n ${{ env.NAMESPACE }}
+                  echo "⚠️ Rollout aborted - rolling back" >> $GITHUB_STEP_SUMMARY
+                  ;;
+              esac
+              
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
+          
+          ACTION="${{ github.event.inputs.action }}"
+          [ "$ACTION" = "promote" ] && EMOJI="⏭️" && TEXT="Canary promoted to next step"
+          [ "$ACTION" = "abort" ] && EMOJI="🛑" && TEXT="Canary rollout aborted"
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "'"${EMOJI}"' *'"${TEXT}"'*\n\nEnvironment: QA\nTriggered by: ${{ github.actor }}"}}
+              ]
+            }' \
+            "$SLACK_WEBHOOK" || true
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # SUMMARY & NEXT STEPS
+  # ════════════════════════════════════════════════════════════════════════════════
+  summary:
+    name: "📋 Summary"
+    runs-on: ubuntu-latest
+    needs: [canary-status]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎛️ Quick Actions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | Description |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| [⏭️ Promote](../workflows/50-cd-canary-monitor.yaml?action=promote) | Skip to next canary step |" >> $GITHUB_STEP_SUMMARY
+          echo "| [🛑 Abort](../workflows/50-cd-canary-monitor.yaml?action=abort) | Abort and rollback |" >> $GITHUB_STEP_SUMMARY
+          echo "| [📊 Refresh](../workflows/50-cd-canary-monitor.yaml?action=monitor) | Refresh status |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Environment URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vote App:** https://opsera-voting-app-qa.agent.opsera.dev" >> $GITHUB_STEP_SUMMARY
+          echo "- **Results:** https://results.opsera-voting-app-qa.agent.opsera.dev" >> $GITHUB_STEP_SUMMARY

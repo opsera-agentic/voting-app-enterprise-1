@@ -1,0 +1,300 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║              ENTERPRISE DEPLOYMENT LANDSCAPE & SUMMARY                         ║
+# ║                                                                                ║
+# ║  Comprehensive deployment status dashboard showing:                            ║
+# ║  • All environment status (DEV, QA)                                            ║
+# ║  • Build version matrix                                                        ║
+# ║  • Canary deployment progress                                                  ║
+# ║  • Recent deployment history                                                   ║
+# ║  • Pipeline health metrics                                                     ║
+# ║                                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "📈 Deployment Landscape"
+
+on:
+  workflow_dispatch:
+    inputs:
+      slack_notify:
+        description: 'Send report to Slack'
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 9,17 * * 1-5'  # 9am and 5pm weekdays
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  landscape:
+    name: "📈 Generate Landscape"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # HEADER
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Generate Header
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🌍 Enterprise Deployment Landscape
+          
+          **Application:** voting-app | **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')
+          
+          ---
+          
+          ## 🔄 Pipeline Architecture
+          
+          ```
+          ┌─────────────────────────────────────────────────────────────────────────────┐
+          │                        ENTERPRISE CI/CD PIPELINE                            │
+          ├─────────────────────────────────────────────────────────────────────────────┤
+          │                                                                             │
+          │   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐     │
+          │   │  CODE   │   │  TEST   │   │  BUILD  │   │  DEV    │   │   QA    │     │
+          │   │ COMMIT  │──▶│ & SCAN  │──▶│ & PUSH  │──▶│ DEPLOY  │──▶│ CANARY  │     │
+          │   └─────────┘   └─────────┘   └─────────┘   └─────────┘   └─────────┘     │
+          │                      │                           │             │           │
+          │                      ▼                           ▼             ▼           │
+          │                ┌──────────┐                ┌──────────┐  ┌──────────┐      │
+          │                │ PARALLEL │                │  SMOKE   │  │ 10%→30%  │      │
+          │                │ SCANNING │                │  TESTS   │  │ →60%→100%│      │
+          │                └──────────┘                └──────────┘  └──────────┘      │
+          │                                                  │                         │
+          │                                                  ▼                         │
+          │                                           ┌──────────┐                     │
+          │                                           │  SLACK   │                     │
+          │                                           │ APPROVAL │                     │
+          │                                           └──────────┘                     │
+          │                                                                             │
+          └─────────────────────────────────────────────────────────────────────────────┘
+          ```
+          
+          ---
+          
+          EOF
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # ENVIRONMENT STATUS
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Environment Status
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          
+          echo "## 📊 Environment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Health | Sync | Build | Last Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|--------|------|-------|---------------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ENV in dev qa; do
+            APP="${{ env.APP_NAME }}-${ENV}"
+            
+            if kubectl get application "${APP}" -n argocd &>/dev/null; then
+              SYNC=$(kubectl get application "${APP}" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+              HEALTH=$(kubectl get application "${APP}" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+              LAST_SYNC=$(kubectl get application "${APP}" -n argocd -o jsonpath='{.status.operationState.finishedAt}' 2>/dev/null || echo "Never")
+              
+              # Get image tag
+              OVERLAY=".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}/kustomization.yaml"
+              if [ -f "$OVERLAY" ]; then
+                TAG=$(grep -A2 "name: vote$" "$OVERLAY" | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' "' || echo "N/A")
+                COMMIT=$(echo "$TAG" | cut -d'-' -f1)
+                TAG_LINK="[\`${TAG:0:15}\`](${REPO_URL}/commit/${COMMIT})"
+              else
+                TAG_LINK="N/A"
+              fi
+              
+              # Format last sync
+              if [ -n "$LAST_SYNC" ] && [ "$LAST_SYNC" != "Never" ]; then
+                LAST_SYNC_FMT=$(date -d "$LAST_SYNC" '+%m/%d %H:%M' 2>/dev/null || echo "$LAST_SYNC")
+              else
+                LAST_SYNC_FMT="Never"
+              fi
+              
+              # Status emojis
+              case "$HEALTH" in
+                "Healthy") H="🟢" ;;
+                "Progressing") H="🔵" ;;
+                "Degraded") H="🔴" ;;
+                *) H="⚪" ;;
+              esac
+              
+              case "$SYNC" in
+                "Synced") S="✅" ;;
+                "OutOfSync") S="⚠️" ;;
+                *) S="❓" ;;
+              esac
+              
+              # Environment label
+              [ "$ENV" = "qa" ] && LABEL="**QA** 🐤" || LABEL="**DEV**"
+              
+              echo "| ${LABEL} | ${H} ${HEALTH} | ${S} ${SYNC} | ${TAG_LINK} | ${LAST_SYNC_FMT} |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # BUILD VERSION MATRIX
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Build Version Matrix
+        run: |
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          
+          echo "## 🏷️ Build Version Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | DEV | QA |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|-----|" >> $GITHUB_STEP_SUMMARY
+          
+          for SERVICE in vote result worker; do
+            ROW="| **${SERVICE}** |"
+            
+            for ENV in dev qa; do
+              OVERLAY=".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}/kustomization.yaml"
+              if [ -f "$OVERLAY" ]; then
+                TAG=$(grep -A2 "name: ${SERVICE}$" "$OVERLAY" | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' "' || echo "")
+                if [ -n "$TAG" ] && [ "$TAG" != "-" ]; then
+                  COMMIT=$(echo "$TAG" | cut -d'-' -f1)
+                  ROW="${ROW} [\`${TAG:0:12}\`](${REPO_URL}/commit/${COMMIT}) |"
+                else
+                  ROW="${ROW} - |"
+                fi
+              else
+                ROW="${ROW} - |"
+              fi
+            done
+            
+            echo "$ROW" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # CANARY STATUS
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Canary Status
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          NS="${{ env.APP_NAME }}-qa"
+          
+          if kubectl get namespace "${NS}" &>/dev/null; then
+            echo "## 🐤 Canary Status (QA)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Rollout | Phase | Step | Traffic Split |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|-------|------|---------------|" >> $GITHUB_STEP_SUMMARY
+            
+            for ROLLOUT in vote-rollout result-rollout; do
+              if kubectl get rollout "${ROLLOUT}" -n "${NS}" &>/dev/null; then
+                JSON=$(kubectl get rollout "${ROLLOUT}" -n "${NS}" -o json 2>/dev/null)
+                
+                PHASE=$(echo "$JSON" | jq -r '.status.phase // "Unknown"')
+                STEP=$(echo "$JSON" | jq -r '.status.currentStepIndex // 0')
+                TOTAL=$(echo "$JSON" | jq -r '.spec.strategy.canary.steps | length')
+                
+                CANARY=$(echo "$JSON" | jq -r 'if .status.canary.weights.canary then .status.canary.weights.canary else 0 end')
+                [[ ! "$CANARY" =~ ^[0-9]+$ ]] && CANARY=0
+                STABLE=$((100 - CANARY))
+                
+                case "$PHASE" in
+                  "Healthy") EMOJI="🟢" ;;
+                  "Progressing") EMOJI="🔵" ;;
+                  "Paused") EMOJI="⏸️" ;;
+                  *) EMOJI="⚪" ;;
+                esac
+                
+                echo "| ${ROLLOUT} | ${EMOJI} ${PHASE} | ${STEP}/${TOTAL} | Stable ${STABLE}% / Canary ${CANARY}% |" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # ENVIRONMENT URLS
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Environment URLs
+        run: |
+          echo "## 🔗 Environment URLs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Vote App | Results App |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|----------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **DEV** | [opsera-voting-app.agent.opsera.dev](https://opsera-voting-app.agent.opsera.dev) | [results.opsera-voting-app.agent.opsera.dev](https://results.opsera-voting-app.agent.opsera.dev) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **QA** 🐤 | [opsera-voting-app-qa.agent.opsera.dev](https://opsera-voting-app-qa.agent.opsera.dev) | [results.opsera-voting-app-qa.agent.opsera.dev](https://results.opsera-voting-app-qa.agent.opsera.dev) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # QUICK ACTIONS
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Quick Actions
+        run: |
+          echo "## 📋 Quick Actions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Category | Action | Workflow |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **CI** | Test & Scan | [🔍 CI: Test & Scan](../workflows/10-ci-test-scan.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CI** | Build Images | [🔨 CI: Build & Push](../workflows/20-ci-build-push.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CD** | Deploy to DEV | [🚀 CD: Deploy to DEV](../workflows/30-cd-deploy-dev.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CD** | Promote to QA | [⬆️ CD: Promote to QA](../workflows/40-cd-promote-qa.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CD** | Monitor Canary | [📊 CD: Canary Monitor](../workflows/50-cd-canary-monitor.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ops** | Debug Pods | [🔧 Ops: Debug Pods](../workflows/ops-debug-pods.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Infra** | Bootstrap | [🏗️ Bootstrap Infrastructure](../workflows/00-bootstrap-infrastructure.yaml) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Powered by Opsera - The Unified DevOps Platform*" >> $GITHUB_STEP_SUMMARY
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # SLACK NOTIFICATION
+      # ══════════════════════════════════════════════════════════════════════════
+      - name: Send to Slack
+        if: ${{ github.event.inputs.slack_notify == 'true' || github.event_name == 'schedule' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": "📈 Deployment Landscape", "emoji": true}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": "*Application:* `voting-app`\n*Pipeline:* DEV → QA (Canary)"}},
+                {"type": "divider"},
+                {"type": "section", "fields": [
+                  {"type": "mrkdwn", "text": "*DEV*\n🟢 Healthy"},
+                  {"type": "mrkdwn", "text": "*QA*\n🐤 Canary"}
+                ]},
+                {"type": "context", "elements": [
+                  {"type": "mrkdwn", "text": "📊 <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Full Report>"}
+                ]}
+              ]
+            }' \
+            "$SLACK_WEBHOOK" || true
