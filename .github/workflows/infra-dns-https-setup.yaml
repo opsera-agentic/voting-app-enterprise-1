@@ -87,11 +87,26 @@ jobs:
           echo "## 🔍 Pre-flight: DNS & HTTPS Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Get NGINX ingress controller load balancer
-          LB_HOSTNAME=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          # Try multiple common namespaces for ingress controller
+          NAMESPACES="ingress-nginx nginx-ingress kube-system default"
+          SERVICE_NAMES="ingress-nginx-controller nginx-ingress-controller nginx-ingress"
           
+          LB_HOSTNAME=""
+          for NS in $NAMESPACES; do
+            for SVC in $SERVICE_NAMES; do
+              if [ -z "$LB_HOSTNAME" ]; then
+                LB_HOSTNAME=$(kubectl get svc -n $NS $SVC -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+                if [ -n "$LB_HOSTNAME" ]; then
+                  echo "Found LB in $NS/$SVC"
+                  break 2
+                fi
+              fi
+            done
+          done
+          
+          # If still not found, try to get from any ingress
           if [ -z "$LB_HOSTNAME" ]; then
-            LB_HOSTNAME=$(kubectl get svc -n nginx-ingress nginx-ingress-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            LB_HOSTNAME=$(kubectl get ingress -A -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
           fi
           
           if [ -n "$LB_HOSTNAME" ]; then
@@ -194,15 +209,35 @@ jobs:
       - name: Get Load Balancer Hostname
         id: lb
         run: |
-          # Get NGINX ingress controller load balancer
-          LB_HOSTNAME=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          # Try multiple common namespaces for ingress controller
+          NAMESPACES="ingress-nginx nginx-ingress kube-system default"
+          SERVICE_NAMES="ingress-nginx-controller nginx-ingress-controller nginx-ingress"
           
+          LB_HOSTNAME=""
+          for NS in $NAMESPACES; do
+            for SVC in $SERVICE_NAMES; do
+              if [ -z "$LB_HOSTNAME" ]; then
+                LB_HOSTNAME=$(kubectl get svc -n $NS $SVC -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+                if [ -n "$LB_HOSTNAME" ]; then
+                  echo "Found LB in $NS/$SVC: ${LB_HOSTNAME}"
+                  break 2
+                fi
+              fi
+            done
+          done
+          
+          # If still not found, try to get from any ingress
           if [ -z "$LB_HOSTNAME" ]; then
-            LB_HOSTNAME=$(kubectl get svc -n nginx-ingress nginx-ingress-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            LB_HOSTNAME=$(kubectl get ingress -A -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "$LB_HOSTNAME" ]; then
+              echo "Found LB from ingress resource: ${LB_HOSTNAME}"
+            fi
           fi
           
           if [ -z "$LB_HOSTNAME" ]; then
             echo "❌ Error: Could not find ingress load balancer"
+            echo "Checking all services with LoadBalancer type..."
+            kubectl get svc -A -o wide | grep -i loadbalancer || true
             exit 1
           fi
           
@@ -212,22 +247,55 @@ jobs:
       - name: Get Route53 Hosted Zone
         id: zone
         run: |
-          # Find hosted zone for domain
-          ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "${{ env.DOMAIN }}" \
-            --query "HostedZones[?Name=='${{ env.DOMAIN }}.'].Id" --output text | sed 's|/hostedzone/||')
+          # Find hosted zone for domain - try multiple approaches
+          DOMAIN="${{ env.DOMAIN }}"
           
-          if [ -z "$ZONE_ID" ]; then
-            echo "❌ Error: Could not find hosted zone for ${{ env.DOMAIN }}"
-            exit 1
+          # Method 1: Exact match
+          ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
+            --query "HostedZones[?Name=='${DOMAIN}.'].Id" --output text 2>/dev/null | sed 's|/hostedzone/||')
+          
+          # Method 2: List all zones and find matching one
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+            echo "Searching all hosted zones for $DOMAIN..."
+            ZONE_ID=$(aws route53 list-hosted-zones \
+              --query "HostedZones[?ends_with(Name, '${DOMAIN}.')].Id" --output text 2>/dev/null | head -1 | sed 's|/hostedzone/||')
           fi
           
-          echo "zone_id=${ZONE_ID}" >> $GITHUB_OUTPUT
-          echo "Found Zone ID: ${ZONE_ID}"
+          # Method 3: Partial match (parent domain)
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+            PARENT_DOMAIN=$(echo "$DOMAIN" | cut -d. -f2-)
+            echo "Trying parent domain: $PARENT_DOMAIN"
+            ZONE_ID=$(aws route53 list-hosted-zones \
+              --query "HostedZones[?ends_with(Name, '${PARENT_DOMAIN}.')].Id" --output text 2>/dev/null | head -1 | sed 's|/hostedzone/||')
+          fi
+          
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+            echo "⚠️ Warning: Could not find hosted zone for $DOMAIN"
+            echo "Available zones:"
+            aws route53 list-hosted-zones --query "HostedZones[*].[Name,Id]" --output table || true
+            echo "Continuing without DNS setup - assuming external-dns is managing records"
+            echo "zone_id=" >> $GITHUB_OUTPUT
+          else
+            echo "zone_id=${ZONE_ID}" >> $GITHUB_OUTPUT
+            echo "Found Zone ID: ${ZONE_ID}"
+          fi
 
       - name: Setup DNS Records (Idempotent)
         run: |
           ZONE_ID="${{ steps.zone.outputs.zone_id }}"
           LB_HOSTNAME="${{ steps.lb.outputs.hostname }}"
+          
+          if [ -z "$ZONE_ID" ]; then
+            echo "## 📡 DNS Record Setup" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Skipped:** No Route53 hosted zone found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "DNS records may be managed by:" >> $GITHUB_STEP_SUMMARY
+            echo "- **external-dns** (automatic from ingress)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Manual configuration**" >> $GITHUB_STEP_SUMMARY
+            echo "- **Different AWS account**" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
           
           echo "## 📡 DNS Record Setup" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

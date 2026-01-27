@@ -1,0 +1,114 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ENDPOINT VERIFICATION - Quick HTTPS Test                                     ║
+# ║                                                                                ║
+# ║  Simple, fast verification of HTTPS endpoints:                                 ║
+# ║  • DEV: https://opsera-voting-app.agent.opsera.dev                             ║
+# ║  • QA:  https://opsera-voting-app-qa.agent.opsera.dev                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🔗 Ops: Test Endpoints"
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run every hour during business hours
+    - cron: '0 9-17 * * 1-5'
+
+env:
+  DEV_URL: https://opsera-voting-app.agent.opsera.dev
+  QA_URL: https://opsera-voting-app-qa.agent.opsera.dev
+
+jobs:
+  test-endpoints:
+    name: "🔗 Test HTTPS Endpoints"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Test DEV Endpoint
+        id: dev
+        run: |
+          echo "## 🔗 Endpoint Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | URL | Status | Response Time |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-----|--------|---------------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Test DEV
+          START=$(date +%s%N)
+          DEV_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 "${{ env.DEV_URL }}/" 2>/dev/null || echo "000")
+          END=$(date +%s%N)
+          DEV_TIME=$(( (END - START) / 1000000 ))
+          
+          if [ "$DEV_STATUS" = "200" ]; then
+            echo "| DEV | [${{ env.DEV_URL }}](${{ env.DEV_URL }}) | ✅ HTTP ${DEV_STATUS} | ${DEV_TIME}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "dev_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "| DEV | [${{ env.DEV_URL }}](${{ env.DEV_URL }}) | ❌ HTTP ${DEV_STATUS} | ${DEV_TIME}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "dev_ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Test QA Endpoint
+        id: qa
+        run: |
+          # Test QA
+          START=$(date +%s%N)
+          QA_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 "${{ env.QA_URL }}/" 2>/dev/null || echo "000")
+          END=$(date +%s%N)
+          QA_TIME=$(( (END - START) / 1000000 ))
+          
+          if [ "$QA_STATUS" = "200" ]; then
+            echo "| QA | [${{ env.QA_URL }}](${{ env.QA_URL }}) | ✅ HTTP ${QA_STATUS} | ${QA_TIME}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "qa_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "| QA | [${{ env.QA_URL }}](${{ env.QA_URL }}) | ❌ HTTP ${QA_STATUS} | ${QA_TIME}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "qa_ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Test TLS Certificates
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔒 TLS Certificate Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Issuer | Expires |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          # DEV Certificate
+          DEV_CERT=$(echo | timeout 5 openssl s_client -servername opsera-voting-app.agent.opsera.dev -connect opsera-voting-app.agent.opsera.dev:443 2>/dev/null | openssl x509 -noout -issuer -enddate 2>/dev/null || echo "")
+          if [ -n "$DEV_CERT" ]; then
+            DEV_ISSUER=$(echo "$DEV_CERT" | grep issuer | sed 's/.*O = //' | cut -d',' -f1)
+            DEV_EXPIRY=$(echo "$DEV_CERT" | grep notAfter | cut -d= -f2)
+            echo "| DEV | ${DEV_ISSUER:-Unknown} | ${DEV_EXPIRY:-Unknown} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| DEV | ⚠️ Could not retrieve | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # QA Certificate
+          QA_CERT=$(echo | timeout 5 openssl s_client -servername opsera-voting-app-qa.agent.opsera.dev -connect opsera-voting-app-qa.agent.opsera.dev:443 2>/dev/null | openssl x509 -noout -issuer -enddate 2>/dev/null || echo "")
+          if [ -n "$QA_CERT" ]; then
+            QA_ISSUER=$(echo "$QA_CERT" | grep issuer | sed 's/.*O = //' | cut -d',' -f1)
+            QA_EXPIRY=$(echo "$QA_CERT" | grep notAfter | cut -d= -f2)
+            echo "| QA | ${QA_ISSUER:-Unknown} | ${QA_EXPIRY:-Unknown} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| QA | ⚠️ Could not retrieve | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Summary
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          
+          DEV_OK="${{ steps.dev.outputs.dev_ok }}"
+          QA_OK="${{ steps.qa.outputs.qa_ok }}"
+          
+          if [ "$DEV_OK" = "true" ] && [ "$QA_OK" = "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ All endpoints healthy!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚠️ Some endpoints are not responding" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Troubleshooting:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check if pods are running: \`kubectl get pods -n voting-app-dev\`" >> $GITHUB_STEP_SUMMARY
+            echo "2. Check ingress status: \`kubectl get ingress -A\`" >> $GITHUB_STEP_SUMMARY
+            echo "3. Check DNS: \`dig opsera-voting-app.agent.opsera.dev\`" >> $GITHUB_STEP_SUMMARY
+          fi
