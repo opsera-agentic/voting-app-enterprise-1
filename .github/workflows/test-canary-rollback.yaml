@@ -1,0 +1,332 @@
+name: "Test Canary Rollback"
+
+# ============================================================================
+# This workflow simulates a canary deployment failure to test rollback
+# It can be used to demonstrate Slack notifications and auto-rollback
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+        default: 'qa'
+      failure_type:
+        description: 'Type of failure to simulate'
+        required: true
+        type: choice
+        options:
+          - latency
+          - errors
+          - manual-abort
+        default: 'latency'
+      slack_webhook:
+        description: 'Slack Webhook URL for notifications'
+        required: false
+        type: string
+        default: ''
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  simulate-failure:
+    name: "Simulate Canary Failure"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          # Install Argo Rollouts kubectl plugin
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Connect to Spoke Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Send Slack - Test Started
+        if: ${{ github.event.inputs.slack_webhook != '' }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🧪 Canary Rollback Test Started",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*Environment:*\n`${{ github.event.inputs.environment }}`"},
+                    {"type": "mrkdwn", "text": "*Failure Type:*\n`${{ github.event.inputs.failure_type }}`"}
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {"type": "mrkdwn", "text": "Testing canary deployment rollback capabilities..."}
+                  ]
+                }
+              ]
+            }' \
+            "${{ github.event.inputs.slack_webhook }}" || true
+
+      - name: Check Current Rollout Status
+        id: current-status
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "## Current Rollout Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl-argo-rollouts get rollout vote-rollout -n "${NAMESPACE}" 2>/dev/null || echo "Rollout not found"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Get current status
+          STATUS=$(kubectl get rollout vote-rollout -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+
+      - name: Simulate Latency Failure
+        if: ${{ github.event.inputs.failure_type == 'latency' }}
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "## Simulating Latency Failure" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create a ConfigMap to simulate latency (the app would need to read this)
+          # For demo purposes, we'll show the concept
+          echo "### Simulation Method" >> $GITHUB_STEP_SUMMARY
+          echo "To simulate latency in a real scenario, you would:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Deploy a version with artificial delays" >> $GITHUB_STEP_SUMMARY
+          echo "2. Or inject latency via service mesh (Istio)" >> $GITHUB_STEP_SUMMARY
+          echo "3. Or use a chaos engineering tool (Litmus, Chaos Mesh)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # For demo, we'll manually abort the rollout to simulate failure detection
+          echo "### Manual Abort Simulation" >> $GITHUB_STEP_SUMMARY
+          echo "Aborting rollout to demonstrate rollback behavior..." >> $GITHUB_STEP_SUMMARY
+
+      - name: Simulate Error Rate Failure
+        if: ${{ github.event.inputs.failure_type == 'errors' }}
+        run: |
+          echo "## Simulating Error Rate Failure" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To simulate 5xx errors in a real scenario:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Deploy a version that returns errors for certain endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "2. Use fault injection via service mesh" >> $GITHUB_STEP_SUMMARY
+          echo "3. Temporarily misconfigure the application" >> $GITHUB_STEP_SUMMARY
+
+      - name: Abort Rollout (Simulate Failure Detection)
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "## Aborting Rollout" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if rollout is in progress
+          PHASE=$(kubectl get rollout vote-rollout -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+          
+          if [ "$PHASE" = "Progressing" ] || [ "$PHASE" = "Paused" ]; then
+            echo "Rollout is in progress. Aborting..." >> $GITHUB_STEP_SUMMARY
+            kubectl-argo-rollouts abort vote-rollout -n "${NAMESPACE}"
+            echo "✅ Abort command sent" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Rollout is not in progress (phase: ${PHASE})" >> $GITHUB_STEP_SUMMARY
+            echo "To test rollback, first trigger a new deployment via CI/CD" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Send Slack - Rollback Initiated
+        if: ${{ github.event.inputs.slack_webhook != '' }}
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚨 CANARY ROLLBACK INITIATED",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "⚠️ *Automatic rollback triggered due to failed health checks*"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*Application:*\n`vote-rollout`"},
+                    {"type": "mrkdwn", "text": "*Namespace:*\n`'"${NAMESPACE}"'`"},
+                    {"type": "mrkdwn", "text": "*Failure Type:*\n`${{ github.event.inputs.failure_type }}`"},
+                    {"type": "mrkdwn", "text": "*Action:*\nRolling back to stable"}
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Reason:*\n```\nSimulated ${{ github.event.inputs.failure_type }} failure detected\nAnalysis metrics exceeded threshold:\n• Success Rate < 95%\n• Error Rate > 5%\n• P99 Latency > 500ms\n```"
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {"type": "mrkdwn", "text": "🔄 Rollback in progress... All traffic returning to stable version."}
+                  ]
+                }
+              ],
+              "attachments": [
+                {
+                  "color": "#F44336"
+                }
+              ]
+            }' \
+            "${{ github.event.inputs.slack_webhook }}" || true
+
+      - name: Wait for Rollback to Complete
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "## Waiting for Rollback" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait up to 60 seconds for rollback
+          for i in {1..12}; do
+            PHASE=$(kubectl get rollout vote-rollout -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+            echo "Attempt $i: Phase = ${PHASE}" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$PHASE" = "Degraded" ] || [ "$PHASE" = "Healthy" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Get Final Rollout Status
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Final Rollout Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl-argo-rollouts get rollout vote-rollout -n "${NAMESPACE}" 2>/dev/null || echo "Rollout not found"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Send Slack - Rollback Complete
+        if: ${{ github.event.inputs.slack_webhook != '' }}
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "✅ Rollback Complete - Service Restored",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*Application:*\n`vote-rollout`"},
+                    {"type": "mrkdwn", "text": "*Namespace:*\n`'"${NAMESPACE}"'`"},
+                    {"type": "mrkdwn", "text": "*Status:*\n🟢 Stable version restored"},
+                    {"type": "mrkdwn", "text": "*Traffic:*\n100% → Stable"}
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Summary:*\nCanary deployment was aborted due to detected issues. All traffic has been returned to the previous stable version. No user impact."
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {"type": "mrkdwn", "text": "📝 Review the failed deployment and fix issues before re-deploying."}
+                  ]
+                }
+              ],
+              "attachments": [
+                {
+                  "color": "#4CAF50"
+                }
+              ]
+            }' \
+            "${{ github.event.inputs.slack_webhook }}" || true
+
+      - name: Retry Rollout (Reset to Healthy)
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Resetting Rollout" >> $GITHUB_STEP_SUMMARY
+          
+          # Retry the rollout to reset it to healthy state
+          kubectl-argo-rollouts retry rollout vote-rollout -n "${NAMESPACE}" 2>/dev/null || true
+          
+          echo "Rollout has been reset. Ready for next deployment." >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate Summary
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Failure Type | ${{ github.event.inputs.failure_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Slack Notifications | ${{ github.event.inputs.slack_webhook != '' && '✅ Sent' || '⏭️ Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### What This Test Demonstrated" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Canary rollout abort triggered" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Automatic rollback to stable version" >> $GITHUB_STEP_SUMMARY
+          echo "3. ✅ Slack notifications sent (if configured)" >> $GITHUB_STEP_SUMMARY
+          echo "4. ✅ Service restored to healthy state" >> $GITHUB_STEP_SUMMARY

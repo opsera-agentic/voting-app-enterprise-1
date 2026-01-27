@@ -1,0 +1,278 @@
+# ============================================================================
+# Argo Rollouts Notification Configuration
+# ============================================================================
+# This ConfigMap configures Slack notifications for canary rollout events
+# Requires: argo-rollouts-notification-secret with SLACK_WEBHOOK_URL
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argo-rollouts-notification-configmap
+  namespace: argo-rollouts
+data:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SLACK SERVICE CONFIGURATION
+  # ═══════════════════════════════════════════════════════════════════════════
+  service.slack: |
+    token: $slack-token
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # NOTIFICATION TEMPLATES
+  # ═══════════════════════════════════════════════════════════════════════════
+  
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CANARY STARTED
+  # ─────────────────────────────────────────────────────────────────────────────
+  template.rollout-started: |
+    message: |
+      🚀 *Canary Deployment Started*
+      
+      *Application:* {{.rollout.metadata.name}}
+      *Namespace:* {{.rollout.metadata.namespace}}
+      *New Image:* {{(index .rollout.spec.template.spec.containers 0).image}}
+      
+      Canary rollout initiated. Traffic will be gradually shifted.
+    slack:
+      attachments: |
+        [{
+          "color": "#2196F3",
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "🚀 *Canary Deployment Started*\n\n*Application:* `{{.rollout.metadata.name}}`\n*Namespace:* `{{.rollout.metadata.namespace}}`"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*New Image:*\n`{{(index .rollout.spec.template.spec.containers 0).image}}`"},
+                {"type": "mrkdwn", "text": "*Strategy:*\nCanary (10% → 30% → 60% → 100%)"}
+              ]
+            }
+          ]
+        }]
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CANARY STEP COMPLETED
+  # ─────────────────────────────────────────────────────────────────────────────
+  template.rollout-step-completed: |
+    message: |
+      📊 *Canary Step Completed*
+      
+      *Application:* {{.rollout.metadata.name}}
+      *Current Step:* {{.rollout.status.currentStepIndex}}/{{len .rollout.spec.strategy.canary.steps}}
+      *Traffic Weight:* {{.rollout.status.canary.weights.canary.weight}}%
+      
+      Analysis passed. Proceeding to next step.
+    slack:
+      attachments: |
+        [{
+          "color": "#4CAF50",
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "📊 *Canary Step Completed*"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Application:*\n`{{.rollout.metadata.name}}`"},
+                {"type": "mrkdwn", "text": "*Namespace:*\n`{{.rollout.metadata.namespace}}`"},
+                {"type": "mrkdwn", "text": "*Current Step:*\n{{add .rollout.status.currentStepIndex 1}}/{{len .rollout.spec.strategy.canary.steps}}"},
+                {"type": "mrkdwn", "text": "*Canary Traffic:*\n{{.rollout.status.canary.weights.canary.weight}}%"}
+              ]
+            },
+            {
+              "type": "context",
+              "elements": [{"type": "mrkdwn", "text": "✅ Analysis passed - proceeding to next step"}]
+            }
+          ]
+        }]
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CANARY PROMOTED (SUCCESS)
+  # ─────────────────────────────────────────────────────────────────────────────
+  template.rollout-completed: |
+    message: |
+      ✅ *Canary Deployment Successful*
+      
+      *Application:* {{.rollout.metadata.name}}
+      *Namespace:* {{.rollout.metadata.namespace}}
+      *Image:* {{(index .rollout.spec.template.spec.containers 0).image}}
+      
+      All canary steps completed successfully. 100% traffic now on new version.
+    slack:
+      attachments: |
+        [{
+          "color": "#4CAF50",
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "✅ *Canary Deployment Successful*"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Application:*\n`{{.rollout.metadata.name}}`"},
+                {"type": "mrkdwn", "text": "*Namespace:*\n`{{.rollout.metadata.namespace}}`"},
+                {"type": "mrkdwn", "text": "*New Image:*\n`{{(index .rollout.spec.template.spec.containers 0).image}}`"},
+                {"type": "mrkdwn", "text": "*Status:*\n🟢 Healthy"}
+              ]
+            },
+            {
+              "type": "context",
+              "elements": [{"type": "mrkdwn", "text": "🎉 All traffic now on new version"}]
+            }
+          ]
+        }]
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CANARY ABORTED (ROLLBACK)
+  # ─────────────────────────────────────────────────────────────────────────────
+  template.rollout-aborted: |
+    message: |
+      🚨 *CANARY DEPLOYMENT ABORTED - ROLLBACK INITIATED*
+      
+      *Application:* {{.rollout.metadata.name}}
+      *Namespace:* {{.rollout.metadata.namespace}}
+      *Failed at Step:* {{.rollout.status.currentStepIndex}}
+      *Canary Traffic:* {{.rollout.status.canary.weights.canary.weight}}%
+      
+      ⚠️ Analysis detected issues. Automatic rollback to stable version in progress.
+    slack:
+      attachments: |
+        [{
+          "color": "#F44336",
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "🚨 *CANARY DEPLOYMENT ABORTED*"
+              }
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "⚠️ *Automatic rollback initiated due to failed health checks*"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Application:*\n`{{.rollout.metadata.name}}`"},
+                {"type": "mrkdwn", "text": "*Namespace:*\n`{{.rollout.metadata.namespace}}`"},
+                {"type": "mrkdwn", "text": "*Failed at Step:*\n{{add .rollout.status.currentStepIndex 1}}"},
+                {"type": "mrkdwn", "text": "*Affected Traffic:*\n{{.rollout.status.canary.weights.canary.weight}}%"}
+              ]
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*Rollback Reason:*\nAnalysis metrics exceeded failure thresholds (Success Rate <95%, Error Rate >5%, or P99 Latency >500ms)"
+              }
+            },
+            {
+              "type": "context",
+              "elements": [{"type": "mrkdwn", "text": "🔄 Rolling back to previous stable version..."}]
+            }
+          ]
+        }]
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # ANALYSIS FAILED
+  # ─────────────────────────────────────────────────────────────────────────────
+  template.analysis-run-failed: |
+    message: |
+      ❌ *Canary Analysis Failed*
+      
+      *Application:* {{.rollout.metadata.name}}
+      *Metric:* Analysis metrics failed threshold checks
+      
+      Triggering automatic rollback.
+    slack:
+      attachments: |
+        [{
+          "color": "#FF9800",
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "❌ *Canary Analysis Failed*"
+              }
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Application:*\n`{{.rollout.metadata.name}}`"},
+                {"type": "mrkdwn", "text": "*Namespace:*\n`{{.rollout.metadata.namespace}}`"}
+              ]
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*Possible Issues:*\n• Success Rate below 95%\n• Error Rate above 5%\n• P99 Latency above 500ms"
+              }
+            },
+            {
+              "type": "context",
+              "elements": [{"type": "mrkdwn", "text": "⚠️ Initiating automatic rollback..."}]
+            }
+          ]
+        }]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TRIGGERS - When to send notifications
+  # ═══════════════════════════════════════════════════════════════════════════
+  trigger.on-rollout-started: |
+    - send: [rollout-started]
+  
+  trigger.on-rollout-step-completed: |
+    - send: [rollout-step-completed]
+  
+  trigger.on-rollout-completed: |
+    - send: [rollout-completed]
+  
+  trigger.on-rollout-aborted: |
+    - send: [rollout-aborted]
+  
+  trigger.on-analysis-run-failed: |
+    - send: [analysis-run-failed]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEFAULT SUBSCRIPTIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+  defaultTriggers: |
+    - on-rollout-started
+    - on-rollout-step-completed
+    - on-rollout-completed
+    - on-rollout-aborted
+    - on-analysis-run-failed
+
+---
+# ============================================================================
+# Argo Rollouts Notification Secret Template
+# ============================================================================
+# NOTE: Replace SLACK_TOKEN with your actual Slack Bot Token
+# Create in the argo-rollouts namespace
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argo-rollouts-notification-secret
+  namespace: argo-rollouts
+type: Opaque
+stringData:
+  slack-token: "YOUR_SLACK_BOT_TOKEN_HERE"  # Replace with actual token
