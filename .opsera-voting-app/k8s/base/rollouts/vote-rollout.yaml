@@ -82,14 +82,21 @@ spec:
       - pause: {duration: 2m}
       - setWeight: 100
 
-      # Automated analysis using Prometheus metrics
+      # Automated analysis using New Relic metrics
+      # Options: success-rate (Prometheus), newrelic-combined-analysis (New Relic)
       analysis:
         templates:
-        - templateName: success-rate
+        - templateName: newrelic-combined-analysis
         startingStep: 1
         args:
-        - name: service-name
+        - name: app-name
           value: vote
+        - name: error-threshold
+          value: "5"
+        - name: latency-threshold
+          value: "500"
+        - name: apdex-threshold
+          value: "0.85"
 
       # Traffic routing with NGINX Ingress
       trafficRouting:

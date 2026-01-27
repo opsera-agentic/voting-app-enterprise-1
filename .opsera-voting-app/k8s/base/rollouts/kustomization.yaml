@@ -11,6 +11,7 @@ resources:
   - result-canary-service.yaml
   - analysis-template.yaml
   - analysis-template-http.yaml  # Fallback when Prometheus is not available
+  - analysis-template-newrelic.yaml  # New Relic integration for canary analysis
 
 # Use labels transformer to avoid modifying selectors
 # commonLabels adds to both metadata AND selectors, which breaks Argo Rollouts

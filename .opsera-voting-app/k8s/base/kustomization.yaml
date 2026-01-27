@@ -8,6 +8,7 @@ resources:
   - namespace.yaml
   - configmap.yaml
   - secrets.yaml
+  - newrelic-secret.yaml  # New Relic API key for canary analysis
   # Frontend services
   - vote-deployment.yaml
   - vote-service.yaml

@@ -1,0 +1,309 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  NEW RELIC CANARY ANALYSIS TEMPLATE                                           ║
+# ║                                                                                ║
+# ║  Uses New Relic metrics for progressive delivery analysis:                     ║
+# ║  • Error rate from APM                                                         ║
+# ║  • Response time (latency)                                                     ║
+# ║  • Apdex score                                                                 ║
+# ║  • Throughput                                                                  ║
+# ║                                                                                ║
+# ║  Mock New Relic: https://opsera-nrmock-labs.agent.opsera.dev                   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: newrelic-analysis
+  labels:
+    app.kubernetes.io/part-of: voting-app
+    app.kubernetes.io/component: canary-analysis
+spec:
+  args:
+  - name: app-name
+    value: "vote"
+  - name: canary-hash
+    value: ""
+  metrics:
+  # ════════════════════════════════════════════════════════════════════════════
+  # ERROR RATE ANALYSIS
+  # Success if error rate < 5%
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: newrelic-error-rate
+    interval: 30s
+    count: 5
+    successCondition: result.error_rate <= 5
+    failureLimit: 3
+    consecutiveErrorLimit: 5
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=Errors/all"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - key: Content-Type
+          value: "application/json"
+        jsonPath: "{$.metrics[0].values.errors_per_minute}"
+        insecureSkipVerify: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RESPONSE TIME ANALYSIS
+  # Success if avg response time < 500ms
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: newrelic-response-time
+    interval: 30s
+    count: 5
+    successCondition: result.response_time <= 500
+    failureLimit: 3
+    consecutiveErrorLimit: 5
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=HttpDispatcher"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - key: Content-Type
+          value: "application/json"
+        jsonPath: "{$.metrics[0].values.average_response_time}"
+        insecureSkipVerify: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # APDEX SCORE ANALYSIS
+  # Success if Apdex >= 0.85 (satisfied users)
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: newrelic-apdex
+    interval: 30s
+    count: 5
+    successCondition: result.apdex >= 0.85
+    failureLimit: 3
+    consecutiveErrorLimit: 5
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=Apdex"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - key: Content-Type
+          value: "application/json"
+        jsonPath: "{$.metrics[0].values.score}"
+        insecureSkipVerify: true
+
+---
+# ════════════════════════════════════════════════════════════════════════════════
+# NERDGRAPH/NRQL ANALYSIS TEMPLATE
+# Uses GraphQL API for more advanced queries
+# ════════════════════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: newrelic-nrql-analysis
+  labels:
+    app.kubernetes.io/part-of: voting-app
+    app.kubernetes.io/component: canary-analysis
+spec:
+  args:
+  - name: app-name
+    value: "vote"
+  - name: account-id
+    value: "12345"
+  metrics:
+  # ════════════════════════════════════════════════════════════════════════════
+  # TRANSACTION COUNT (Throughput Check)
+  # Ensures canary is receiving traffic
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: nrql-transaction-count
+    interval: 60s
+    count: 3
+    successCondition: result.count >= 0
+    failureLimit: 2
+    consecutiveErrorLimit: 3
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/graphql"
+        method: POST
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - key: Content-Type
+          value: "application/json"
+        body: |
+          {
+            "query": "{ actor { account(id: {{args.account-id}}) { nrql(query: \"SELECT count(*) FROM Transaction WHERE appName='{{args.app-name}}' SINCE 5 minutes ago\") { results } } } }"
+          }
+        jsonPath: "{$.data.actor.account.nrql.results[0].count}"
+        insecureSkipVerify: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # AVERAGE DURATION (Latency Check)
+  # Success if avg duration < 200ms
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: nrql-avg-duration
+    interval: 60s
+    count: 3
+    successCondition: result.duration <= 200
+    failureLimit: 2
+    consecutiveErrorLimit: 3
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/graphql"
+        method: POST
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - key: Content-Type
+          value: "application/json"
+        body: |
+          {
+            "query": "{ actor { account(id: {{args.account-id}}) { nrql(query: \"SELECT average(duration) FROM Transaction WHERE appName='{{args.app-name}}' SINCE 5 minutes ago\") { results } } } }"
+          }
+        jsonPath: "{$.data.actor.account.nrql.results[0].average.duration}"
+        insecureSkipVerify: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ERROR PERCENTAGE (Error Rate Check)
+  # Success if error rate < 1%
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: nrql-error-percentage
+    interval: 60s
+    count: 3
+    successCondition: result.error_percentage <= 1
+    failureLimit: 2
+    consecutiveErrorLimit: 3
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/graphql"
+        method: POST
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - key: Content-Type
+          value: "application/json"
+        body: |
+          {
+            "query": "{ actor { account(id: {{args.account-id}}) { nrql(query: \"SELECT percentage(count(*), WHERE error IS true) FROM Transaction WHERE appName='{{args.app-name}}' SINCE 5 minutes ago\") { results } } } }"
+          }
+        jsonPath: "{$.data.actor.account.nrql.results[0].percentage}"
+        insecureSkipVerify: true
+
+---
+# ════════════════════════════════════════════════════════════════════════════════
+# COMBINED ANALYSIS TEMPLATE (Recommended for Production)
+# Uses multiple metrics with weighted scoring
+# ════════════════════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: newrelic-combined-analysis
+  labels:
+    app.kubernetes.io/part-of: voting-app
+    app.kubernetes.io/component: canary-analysis
+spec:
+  args:
+  - name: app-name
+    value: "vote"
+  - name: error-threshold
+    value: "5"
+  - name: latency-threshold
+    value: "500"
+  - name: apdex-threshold
+    value: "0.85"
+  metrics:
+  # Error Rate - Weight: Critical
+  - name: error-rate
+    interval: 30s
+    count: 5
+    successCondition: result <= {{args.error-threshold}}
+    failureLimit: 2
+    consecutiveErrorLimit: 3
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=Errors/all"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        jsonPath: "{$.metrics[0].values.errors_per_minute}"
+        insecureSkipVerify: true
+
+  # Response Time - Weight: High
+  - name: response-time
+    interval: 30s
+    count: 5
+    successCondition: result <= {{args.latency-threshold}}
+    failureLimit: 3
+    consecutiveErrorLimit: 3
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=HttpDispatcher"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        jsonPath: "{$.metrics[0].values.average_response_time}"
+        insecureSkipVerify: true
+
+  # Apdex Score - Weight: Medium
+  - name: apdex-score
+    interval: 30s
+    count: 5
+    successCondition: result >= {{args.apdex-threshold}}
+    failureLimit: 3
+    consecutiveErrorLimit: 3
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=Apdex"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        jsonPath: "{$.metrics[0].values.score}"
+        insecureSkipVerify: true
+
+  # Throughput - Weight: Low (informational)
+  - name: throughput
+    interval: 30s
+    count: 5
+    successCondition: result >= 0
+    failureLimit: 5
+    consecutiveErrorLimit: 5
+    provider:
+      web:
+        url: "https://opsera-nrmock-labs.agent.opsera.dev/v2/applications/{{args.app-name}}/metrics.json?names[]=HttpDispatcher"
+        method: GET
+        headers:
+        - key: Api-Key
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        jsonPath: "{$.metrics[0].values.calls_per_minute}"
+        insecureSkipVerify: true

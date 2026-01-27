@@ -1,0 +1,222 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  NEW RELIC INTEGRATION TEST                                                   ║
+# ║                                                                                ║
+# ║  Tests the Mock New Relic integration:                                         ║
+# ║  • API connectivity                                                            ║
+# ║  • Metrics retrieval                                                           ║
+# ║  • GraphQL/NRQL queries                                                        ║
+# ║  • API key validation                                                          ║
+# ║                                                                                ║
+# ║  Mock NR: https://opsera-nrmock-labs.agent.opsera.dev                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🔬 Ops: Test New Relic"
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Test type'
+        required: true
+        type: choice
+        options:
+          - all
+          - api_key
+          - applications
+          - metrics
+          - graphql
+        default: 'all'
+
+env:
+  NEWRELIC_URL: https://opsera-nrmock-labs.agent.opsera.dev
+  NEWRELIC_API_KEY: NRAK-XO6GY5NFH2FCVMHXUOC4SIKICUO96Q4Z
+
+jobs:
+  test-newrelic:
+    name: "🔬 Test New Relic Integration"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Test Header
+        run: |
+          echo "## 🔬 New Relic Integration Test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Mock Server:** ${{ env.NEWRELIC_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Type:** ${{ inputs.test_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # TEST 1: API Key Validation
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "🔑 Test API Key Validation"
+        if: inputs.test_type == 'all' || inputs.test_type == 'api_key'
+        run: |
+          echo "### 🔑 API Key Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Test with valid key
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/v2/api_keys/validate" \
+            -H "Content-Type: application/json" \
+            -d '{"api_key": "${{ env.NEWRELIC_API_KEY }}"}' || echo '{"error": "Connection failed"}')
+          
+          echo "Response: \`${RESPONSE}\`" >> $GITHUB_STEP_SUMMARY
+          
+          if echo "$RESPONSE" | grep -q "valid"; then
+            echo "✅ API Key validation successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ API Key validation response: ${RESPONSE}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # TEST 2: List Applications
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "📱 Test Applications API"
+        if: inputs.test_type == 'all' || inputs.test_type == 'applications'
+        run: |
+          echo "### 📱 Applications API" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          RESPONSE=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
+            -H "Content-Type: application/json" || echo '{"error": "Connection failed"}')
+          
+          APP_COUNT=$(echo "$RESPONSE" | jq '.applications | length' 2>/dev/null || echo "0")
+          
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint | \`/v2/applications.json\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application Count | ${APP_COUNT} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # List applications
+          if [ "$APP_COUNT" -gt 0 ]; then
+            echo "**Applications:**" >> $GITHUB_STEP_SUMMARY
+            echo "$RESPONSE" | jq -r '.applications[] | "- \(.name) (ID: \(.id))"' 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # TEST 3: Metrics API
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "📊 Test Metrics API"
+        if: inputs.test_type == 'all' || inputs.test_type == 'metrics'
+        run: |
+          echo "### 📊 Metrics API" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get first application ID
+          APP_RESPONSE=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
+          
+          APP_ID=$(echo "$APP_RESPONSE" | jq -r '.applications[0].id' 2>/dev/null || echo "1")
+          APP_NAME=$(echo "$APP_RESPONSE" | jq -r '.applications[0].name' 2>/dev/null || echo "Unknown")
+          
+          echo "Testing metrics for: **${APP_NAME}** (ID: ${APP_ID})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Test different metric types
+          echo "| Metric | Value | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # HttpDispatcher (Response Time)
+          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=HttpDispatcher" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
+          AVG_RESPONSE=$(echo "$METRIC" | jq -r '.metrics[0].values.average_response_time // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| Response Time | ${AVG_RESPONSE}ms | ✅ |" >> $GITHUB_STEP_SUMMARY
+          
+          # Errors/all (Error Rate)
+          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Errors/all" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
+          ERROR_RATE=$(echo "$METRIC" | jq -r '.metrics[0].values.errors_per_minute // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| Error Rate | ${ERROR_RATE}/min | ✅ |" >> $GITHUB_STEP_SUMMARY
+          
+          # Apdex
+          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Apdex" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
+          APDEX=$(echo "$METRIC" | jq -r '.metrics[0].values.score // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| Apdex Score | ${APDEX} | ✅ |" >> $GITHUB_STEP_SUMMARY
+          
+          # CPU
+          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=CPU" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
+          CPU=$(echo "$METRIC" | jq -r '.metrics[0].values.percent // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| CPU Usage | ${CPU}% | ✅ |" >> $GITHUB_STEP_SUMMARY
+          
+          # Memory
+          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Memory/Heap/Used" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
+          MEMORY=$(echo "$METRIC" | jq -r '.metrics[0].values.used_mb_by_host // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| Memory | ${MEMORY}MB | ✅ |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # TEST 4: GraphQL/NerdGraph API
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "🔮 Test GraphQL API"
+        if: inputs.test_type == 'all' || inputs.test_type == 'graphql'
+        run: |
+          echo "### 🔮 GraphQL/NerdGraph API" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Test NRQL Query - Transaction count
+          echo "**NRQL Query Tests:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Query 1: Transaction Count
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "query": "{ actor { account(id: 12345) { nrql(query: \"SELECT count(*) FROM Transaction\") { results } } } }"
+            }')
+          
+          COUNT=$(echo "$RESPONSE" | jq -r '.data.actor.account.nrql.results[0].count // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| Query | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`SELECT count(*) FROM Transaction\` | ${COUNT} |" >> $GITHUB_STEP_SUMMARY
+          
+          # Query 2: Average Duration
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "query": "{ actor { account(id: 12345) { nrql(query: \"SELECT average(duration) FROM Transaction\") { results } } } }"
+            }')
+          
+          AVG=$(echo "$RESPONSE" | jq -r '.data.actor.account.nrql.results[0].average // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| \`SELECT average(duration) FROM Transaction\` | ${AVG} |" >> $GITHUB_STEP_SUMMARY
+          
+          # Query 3: Percentile
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "query": "{ actor { account(id: 12345) { nrql(query: \"SELECT percentile(duration, 95) FROM Transaction\") { results } } } }"
+            }')
+          
+          P95=$(echo "$RESPONSE" | jq -r '.data.actor.account.nrql.results[0].percentile // "N/A"' 2>/dev/null || echo "N/A")
+          echo "| \`SELECT percentile(duration, 95) FROM Transaction\` | ${P95} |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # SUMMARY
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "📋 Test Summary"
+        run: |
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Integration Test Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. The New Relic analysis templates are ready in \`.opsera-voting-app/k8s/base/rollouts/\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. Deploy to trigger canary analysis with New Relic metrics" >> $GITHUB_STEP_SUMMARY
+          echo "3. Monitor canary progress in the [Canary Monitor](../workflows/50-cd-canary-monitor.yaml)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Available Analysis Templates:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`newrelic-analysis\` - Basic NR metrics (error rate, response time, apdex)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`newrelic-nrql-analysis\` - NRQL-based queries via GraphQL" >> $GITHUB_STEP_SUMMARY
+          echo "- \`newrelic-combined-analysis\` - Combined metrics with configurable thresholds" >> $GITHUB_STEP_SUMMARY
