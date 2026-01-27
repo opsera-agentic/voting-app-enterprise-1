@@ -1,0 +1,126 @@
+name: "Restart Rollouts"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - qa
+      rollout:
+        description: 'Rollout to restart (or "all")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - vote-rollout
+          - result-rollout
+
+env:
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+  APP_NAME: voting-app
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  restart:
+    name: "Restart Rollouts - ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Connect to Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Restart Rollouts
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          ROLLOUT="${{ github.event.inputs.rollout }}"
+          
+          echo "## 🔄 Rollout Restart" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$ROLLOUT" = "all" ]; then
+            ROLLOUTS="vote-rollout result-rollout"
+          else
+            ROLLOUTS="$ROLLOUT"
+          fi
+          
+          for R in $ROLLOUTS; do
+            echo "### Restarting ${R}..." >> $GITHUB_STEP_SUMMARY
+            echo "Restarting ${R}..."
+            
+            # Restart the rollout (triggers a new deployment)
+            kubectl-argo-rollouts restart "${R}" -n "${NAMESPACE}"
+            echo "✅ Restart initiated for ${R}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Wait for Rollouts to Progress
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "Waiting 60 seconds for rollouts to progress..."
+          sleep 60
+          
+          echo "## 📊 Rollout Status After Restart" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Rollout | Phase | Step | Ready | Message |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|------|-------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout result-rollout; do
+            if kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" &>/dev/null; then
+              PHASE=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}')
+              STEP=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.currentStepIndex}')
+              TOTAL=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o json | jq '.spec.strategy.canary.steps | length')
+              READY=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}')
+              REPLICAS=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.replicas}')
+              MESSAGE=$(kubectl get rollout "${ROLLOUT}" -n "${NAMESPACE}" -o jsonpath='{.status.message}' | head -c 30)
+              
+              case "$PHASE" in
+                "Healthy") EMOJI="🟢" ;;
+                "Progressing") EMOJI="🔵" ;;
+                "Paused") EMOJI="⏸️" ;;
+                "Degraded") EMOJI="🔴" ;;
+                *) EMOJI="⚪" ;;
+              esac
+              
+              echo "| ${ROLLOUT} | ${EMOJI} ${PHASE} | ${STEP:-0}/${TOTAL:-0} | ${READY:-0}/${REPLICAS:-0} | ${MESSAGE:-OK} |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Show Pods
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ github.event.inputs.environment }}"
+          
+          echo "## 🏃 Pod Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n "${NAMESPACE}" -o wide >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
