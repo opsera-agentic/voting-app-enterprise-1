@@ -3,11 +3,14 @@
 # ║              ENTERPRISE CD PIPELINE - PROMOTE TO QA                            ║
 # ║                                                                                ║
 # ║  Stage 4 of the CI/CD Pipeline:                                                ║
+# ║  • Jira ticket creation & tracking                                             ║
 # ║  • Detect current DEV version                                                  ║
 # ║  • Pre-flight checks (DEV health validation)                                   ║
 # ║  • Manual approval gate via Slack + GitHub Environment                         ║
 # ║  • Promote to QA with canary deployment                                        ║
+# ║  • Generate architecture diagram                                               ║
 # ║                                                                                ║
+# ║  Powered by Opsera - The Unified DevOps Platform                               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 name: "⬆️ CD: Promote to QA"
@@ -30,6 +33,11 @@ env:
   APP_NAME: voting-app
   HUB_CLUSTER: argocd-usw2
   SPOKE_CLUSTER: opsera-usw2-np
+  QA_URL: https://opsera-voting-app-qa.agent.opsera.dev
+  QA_RESULTS_URL: https://results.opsera-voting-app-qa.agent.opsera.dev
+  # Jira Configuration
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL || 'https://opsera-jira-mock-labs.agent.opsera.dev' }}
+  JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY || 'PR1' }}
 
 permissions:
   contents: write
@@ -76,12 +84,99 @@ jobs:
           echo "| **Commit** | [${COMMIT_HASH}](${COMMIT_URL}) |" >> $GITHUB_STEP_SUMMARY
 
   # ════════════════════════════════════════════════════════════════════════════════
+  # JIRA: CREATE PROMOTION TICKET
+  # ════════════════════════════════════════════════════════════════════════════════
+  jira-create-ticket:
+    name: "🎫 Create Jira Ticket"
+    runs-on: ubuntu-latest
+    needs: [detect-version]
+    outputs:
+      ticket_key: ${{ steps.create.outputs.ticket_key }}
+      ticket_url: ${{ steps.create.outputs.ticket_url }}
+    
+    steps:
+      - name: Create Promotion Ticket
+        id: create
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          IMAGE_TAG: ${{ needs.detect-version.outputs.image_tag }}
+        run: |
+          echo "## 🎫 Jira Promotion Ticket" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -z "$JIRA_TOKEN" ]; then
+            echo "⚠️ Jira not configured - using mock ticket" >> $GITHUB_STEP_SUMMARY
+            echo "ticket_key=MOCK-002" >> $GITHUB_OUTPUT
+            echo "ticket_url=${{ env.JIRA_BASE_URL }}/ui" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          WORKFLOW_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          
+          DESCRIPTION="⬆️ QA Promotion Request
+
+📋 Promotion Details:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Image Tag: ${IMAGE_TAG}
+• From: DEV → QA
+• Deployment Type: Canary (10% → 30% → 60% → 100%)
+• Requested: ${TIMESTAMP}
+• Requested By: ${GITHUB_ACTOR}
+• Workflow: ${WORKFLOW_URL}
+
+🔄 Promotion Stages:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] Pre-flight check (DEV health)
+[ ] Approval gate
+[ ] Update QA manifests
+[ ] ArgoCD sync
+[ ] Canary rollout (10% → 100%)
+[ ] Generate architecture diagram"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue" \
+            -d "{
+              \"fields\": {
+                \"project\": {\"key\": \"${{ env.JIRA_PROJECT_KEY }}\"},
+                \"summary\": \"[Promote] QA: ${IMAGE_TAG} - ${{ env.APP_NAME }}\",
+                \"description\": \"${DESCRIPTION}\",
+                \"issuetype\": {\"name\": \"Task\"},
+                \"priority\": {\"name\": \"High\"}
+              }
+            }")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+            TICKET_KEY=$(echo "$BODY" | jq -r '.key')
+            TICKET_URL="${{ env.JIRA_BASE_URL }}/ui?issue=${TICKET_KEY}"
+            
+            echo "ticket_key=${TICKET_KEY}" >> $GITHUB_OUTPUT
+            echo "ticket_url=${TICKET_URL}" >> $GITHUB_OUTPUT
+            
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Ticket | [${TICKET_KEY}](${TICKET_URL}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Image Tag | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | ✅ Created |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Failed to create Jira ticket (HTTP ${HTTP_CODE})" >> $GITHUB_STEP_SUMMARY
+            echo "ticket_key=" >> $GITHUB_OUTPUT
+            echo "ticket_url=" >> $GITHUB_OUTPUT
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
   # PRE-FLIGHT CHECK
   # ════════════════════════════════════════════════════════════════════════════════
   preflight-check:
     name: "🔎 Pre-flight Check"
     runs-on: ubuntu-latest
-    needs: [detect-version]
+    needs: [detect-version, jira-create-ticket]
     outputs:
       dev_healthy: ${{ steps.check.outputs.dev_healthy }}
     
@@ -125,19 +220,38 @@ jobs:
             echo "⚠️ **Warning:** DEV is not healthy. Promotion may fail." >> $GITHUB_STEP_SUMMARY
           fi
 
+      - name: Update Jira - Pre-flight Complete
+        if: always()
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          HEALTHY="${{ steps.check.outputs.dev_healthy }}"
+          [ "$HEALTHY" = "true" ] && MSG="✅ Pre-flight check passed - DEV is healthy" || MSG="⚠️ Pre-flight check warning - DEV health issues detected"
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"${MSG}\"}" || true
+
   # ════════════════════════════════════════════════════════════════════════════════
   # SLACK APPROVAL REQUEST
   # ════════════════════════════════════════════════════════════════════════════════
   request-approval:
     name: "📨 Request Approval"
     runs-on: ubuntu-latest
-    needs: [detect-version, preflight-check]
+    needs: [detect-version, jira-create-ticket, preflight-check]
     if: ${{ github.event.inputs.skip_approval != 'true' }}
     
     steps:
       - name: Send Slack Approval Request
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+          TICKET_URL: ${{ needs.jira-create-ticket.outputs.ticket_url }}
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then
             echo "Slack webhook not configured"
@@ -149,6 +263,9 @@ jobs:
           COMMIT_HASH="${{ needs.detect-version.outputs.commit_hash }}"
           APPROVE_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           
+          JIRA_TEXT=""
+          [ -n "$TICKET_KEY" ] && JIRA_TEXT="*Jira:* <${TICKET_URL}|${TICKET_KEY}>\n"
+          
           curl -X POST -H 'Content-type: application/json' \
             --data '{
               "blocks": [
@@ -157,7 +274,7 @@ jobs:
                   {"type": "mrkdwn", "text": "*Image Tag:*\n`'"${IMAGE_TAG}"'`"},
                   {"type": "mrkdwn", "text": "*Commit:*\n<'"${COMMIT_URL}"'|'"${COMMIT_HASH}"'>"}
                 ]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*Promotion Flow:*\nDEV ✅ → *QA* 🐤 (Canary: 10% → 30% → 60% → 100%)"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": "'"${JIRA_TEXT}"'*Promotion Flow:*\nDEV ✅ → *QA* 🐤 (Canary: 10% → 30% → 60% → 100%)"}},
                 {"type": "divider"},
                 {"type": "actions", "elements": [
                   {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & Deploy"}, "style": "primary", "url": "'"${APPROVE_URL}"'"},
@@ -173,13 +290,26 @@ jobs:
           echo "### 📨 Approval Request Sent" >> $GITHUB_STEP_SUMMARY
           echo "Slack notification sent. Waiting for approval..." >> $GITHUB_STEP_SUMMARY
 
+      - name: Update Jira - Awaiting Approval
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"⏳ Awaiting approval for QA promotion\\n\\nSlack notification sent. Manual approval required via GitHub Environment.\"}" || true
+
   # ════════════════════════════════════════════════════════════════════════════════
   # APPROVAL GATE (GitHub Environment)
   # ════════════════════════════════════════════════════════════════════════════════
   approval-gate:
     name: "🚦 Approval Gate"
     runs-on: ubuntu-latest
-    needs: [detect-version, preflight-check, request-approval]
+    needs: [detect-version, jira-create-ticket, preflight-check, request-approval]
     if: ${{ github.event.inputs.skip_approval != 'true' }}
     environment:
       name: qa-approval
@@ -187,6 +317,9 @@ jobs:
     
     steps:
       - name: Approval Confirmed
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
         run: |
           echo "### 🚦 Approval Confirmed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -197,6 +330,15 @@ jobs:
           echo "| Approved By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Time | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Tag | \`${{ needs.detect-version.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          
+          # Update Jira
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"✅ Approval granted\\n\\nApproved by: ${{ github.actor }}\\nTime: $(date -u '+%Y-%m-%d %H:%M:%S UTC')\"}" || true
 
   # ════════════════════════════════════════════════════════════════════════════════
   # DEPLOY TO QA
@@ -204,7 +346,7 @@ jobs:
   deploy-qa:
     name: "🚀 Deploy to QA"
     runs-on: ubuntu-latest
-    needs: [detect-version, approval-gate]
+    needs: [detect-version, jira-create-ticket, approval-gate]
     if: always() && (needs.approval-gate.result == 'success' || github.event.inputs.skip_approval == 'true')
     
     steps:
@@ -238,12 +380,16 @@ jobs:
           echo "Updated with tag: \`${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Commit and Push
+        env:
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin main || true
           git add .
-          git diff --staged --quiet || git commit -m "chore(qa): promote ${{ needs.detect-version.outputs.image_tag }} from DEV [skip ci]"
+          git diff --staged --quiet || git commit -m "chore(qa): promote ${{ needs.detect-version.outputs.image_tag }} from DEV [skip ci]
+
+Jira: ${TICKET_KEY}"
           git push origin main || echo "No changes to push"
 
       - name: Install kubectl
@@ -264,24 +410,333 @@ jobs:
           kubectl patch application "${{ env.APP_NAME }}-qa" -n argocd \
             --type merge -p '{"operation":{"initiatedBy":{"username":"github-actions"},"sync":{"prune":true}}}' || true
 
+      - name: Update Jira - Deploy Started
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"🚀 QA deployment started\\n\\n• Manifests updated\\n• ArgoCD sync triggered\\n• Canary rollout: 10% → 30% → 60% → 100%\"}" || true
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # ARCHITECTURE DIAGRAM
+  # ════════════════════════════════════════════════════════════════════════════════
+  generate-architecture:
+    name: "🏗️ Architecture Diagram"
+    runs-on: ubuntu-latest
+    needs: [jira-create-ticket, deploy-qa]
+    if: always() && needs.deploy-qa.result != 'cancelled'
+    
+    steps:
+      - name: Generate Multi-Environment Architecture
+        env:
+          IMAGE_TAG: ${{ needs.detect-version.outputs.image_tag }}
+        run: |
+          echo "## 🏗️ QA Deployment Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Multi-Environment Overview" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'ARCH'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c5c5c', 'background': '#ffffff'}}}%%
+flowchart TB
+    subgraph INTERNET["☁️ INTERNET"]
+        USER["👤 Users"]
+    end
+
+    subgraph AWS["☁️ AWS CLOUD - us-west-2"]
+        subgraph ROUTE53["🌐 Route 53"]
+            DNS_DEV["vote-dev.opsera.dev"]
+            DNS_QA["vote-qa.opsera.dev"]
+        end
+        
+        subgraph EKS["⎈ EKS: opsera-usw2-np"]
+            subgraph NGINX_NS["🔷 ingress-nginx"]
+                NGINX["NGINX Ingress\n+ TLS Termination"]
+            end
+            
+            subgraph DEV["📦 voting-app-dev"]
+                direction LR
+                DEV_VOTE["🗳️ Vote\n(Stable)"]
+                DEV_REDIS[("🔴 Redis")]
+                DEV_WORKER["⚙️ Worker"]
+                DEV_DB[("🐘 Postgres")]
+                DEV_RESULT["📊 Result"]
+            end
+            
+            subgraph QA["📦 voting-app-qa"]
+                direction LR
+                subgraph CANARY["🐤 Canary Deployment"]
+                    QA_STABLE["🗳️ Vote\n(Stable 90%)"]
+                    QA_CANARY["🗳️ Vote\n(Canary 10%)"]
+                end
+                QA_REDIS[("🔴 Redis")]
+                QA_WORKER["⚙️ Worker"]
+                QA_DB[("🐘 Postgres")]
+                QA_RESULT["📊 Result"]
+            end
+            
+            subgraph PLATFORM["🔧 Platform"]
+                ARGOCD["🔄 ArgoCD"]
+                ROLLOUTS["📈 Argo Rollouts"]
+            end
+        end
+        
+        subgraph ECR["📦 ECR"]
+            IMAGES["vote | result | worker\n:$TAG"]
+        end
+    end
+
+    subgraph CICD["🔄 CI/CD"]
+        GHA["⚡ GitHub Actions"]
+        REPO["📂 Git Repository"]
+    end
+
+    subgraph OBS["📊 Observability"]
+        NR["📈 New Relic"]
+        SLACK["💬 Slack"]
+        JIRA["🎫 Jira"]
+    end
+
+    %% Flow
+    USER -->|"1️⃣"| DNS_DEV & DNS_QA
+    DNS_DEV & DNS_QA -->|"2️⃣"| NGINX
+    NGINX -->|"3️⃣"| DEV & QA
+    
+    REPO -->|"4️⃣ Push"| GHA
+    GHA -->|"5️⃣ Build"| ECR
+    GHA -->|"6️⃣ Sync"| ARGOCD
+    ARGOCD -->|"7️⃣ Deploy"| DEV & QA
+    ROLLOUTS -->|"8️⃣ Canary"| QA
+    
+    DEV_VOTE --> DEV_REDIS --> DEV_WORKER --> DEV_DB --> DEV_RESULT
+    QA_STABLE & QA_CANARY --> QA_REDIS --> QA_WORKER --> QA_DB --> QA_RESULT
+    
+    QA -.->|"Metrics"| NR
+    GHA -.->|"Notify"| SLACK & JIRA
+    NR -.->|"Analysis"| ROLLOUTS
+
+    style CANARY fill:#fff3cd,stroke:#ffc107
+    style QA_CANARY fill:#28a745,stroke:#1e7e34,color:#fff
+```
+ARCH
+
+      - name: Generate Canary Sequence Diagram
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Canary Deployment Sequence" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'SEQ'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'background': '#ffffff', 'actorBkg': '#4a90d9', 'actorTextColor': '#fff'}}}%%
+sequenceDiagram
+    autonumber
+    
+    participant DEV as 👨‍💻 Developer
+    participant GHA as ⚡ GitHub Actions
+    participant JIRA as 🎫 Jira
+    participant ARGO as 🔄 ArgoCD
+    participant ROLLOUT as 📈 Argo Rollouts
+    participant K8S as ⎈ Kubernetes
+    participant NR as 📈 New Relic
+    participant SLACK as 💬 Slack
+
+    rect rgb(255, 248, 240)
+        Note over DEV,GHA: Promotion Request
+        DEV->>GHA: Request QA promotion
+        GHA->>JIRA: Create promotion ticket
+        GHA->>SLACK: Request approval
+    end
+
+    rect rgb(240, 255, 240)
+        Note over GHA,ARGO: Approval & Deploy
+        DEV->>GHA: ✅ Approve promotion
+        GHA->>GHA: Update QA manifests
+        GHA->>ARGO: Trigger sync
+        ARGO->>K8S: Apply rollout spec
+    end
+
+    rect rgb(255, 255, 220)
+        Note over ROLLOUT,NR: Canary Phase 1 (10%)
+        ROLLOUT->>K8S: Scale canary to 10%
+        K8S->>K8S: Route 10% traffic to canary
+        loop Every 30s for 2 min
+            NR->>NR: Collect metrics
+            ROLLOUT->>NR: Query error rate, latency
+        end
+        NR-->>ROLLOUT: ✅ Metrics healthy
+        ROLLOUT->>JIRA: 📝 10% canary healthy
+    end
+
+    rect rgb(255, 250, 230)
+        Note over ROLLOUT,NR: Canary Phase 2 (30%)
+        ROLLOUT->>K8S: Scale canary to 30%
+        loop Analysis
+            ROLLOUT->>NR: Query metrics
+        end
+        NR-->>ROLLOUT: ✅ Healthy
+    end
+
+    rect rgb(255, 245, 220)
+        Note over ROLLOUT,NR: Canary Phase 3 (60%)
+        ROLLOUT->>K8S: Scale canary to 60%
+        loop Analysis
+            ROLLOUT->>NR: Query metrics
+        end
+        NR-->>ROLLOUT: ✅ Healthy
+    end
+
+    rect rgb(240, 255, 240)
+        Note over ROLLOUT,SLACK: Full Promotion (100%)
+        ROLLOUT->>K8S: Promote to 100%
+        ROLLOUT->>K8S: Scale down stable
+        ROLLOUT->>JIRA: ✅ Promotion complete
+        ROLLOUT->>SLACK: ✅ QA deployment successful
+    end
+
+    rect rgb(255, 230, 230)
+        Note over ROLLOUT,SLACK: Rollback (if unhealthy)
+        alt Metrics unhealthy
+            ROLLOUT->>K8S: ❌ Abort canary
+            K8S->>K8S: Route 100% to stable
+            ROLLOUT->>JIRA: ❌ Rollback triggered
+            ROLLOUT->>SLACK: ⚠️ Canary failed
+        end
+    end
+```
+SEQ
+
+      - name: Generate Traffic Split Diagram
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Canary Traffic Progression" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'TRAFFIC'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'background': '#ffffff'}}}%%
+gantt
+    title Canary Traffic Progression
+    dateFormat X
+    axisFormat %s
+    
+    section Stable (Old)
+    100% Traffic    :done, s1, 0, 1
+    90% Traffic     :done, s2, 1, 2
+    70% Traffic     :done, s3, 2, 3
+    40% Traffic     :done, s4, 3, 4
+    0% Traffic      :done, s5, 4, 5
+    
+    section Canary (New)
+    0% Traffic      :c1, 0, 1
+    10% Traffic     :active, c2, 1, 2
+    30% Traffic     :c3, 2, 3
+    60% Traffic     :c4, 3, 4
+    100% Traffic    :crit, c5, 4, 5
+```
+
+| Phase | Stable | Canary | Duration | Analysis |
+|-------|--------|--------|----------|----------|
+| Start | 100% | 0% | - | Baseline |
+| Step 1 | 90% | 10% | 2 min | Error rate < 1% |
+| Step 2 | 70% | 30% | 2 min | Latency p99 < 500ms |
+| Step 3 | 40% | 60% | 2 min | Apdex > 0.9 |
+| Complete | 0% | 100% | - | Full promotion |
+TRAFFIC
+
   # ════════════════════════════════════════════════════════════════════════════════
   # NOTIFY COMPLETION
   # ════════════════════════════════════════════════════════════════════════════════
   notify-complete:
     name: "📢 Notify"
     runs-on: ubuntu-latest
-    needs: [detect-version, deploy-qa]
+    needs: [detect-version, jira-create-ticket, deploy-qa, generate-architecture]
     if: always()
     
     steps:
+      - name: Update Jira - Promotion Complete
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          STATUS="${{ needs.deploy-qa.result }}"
+          [ "$STATUS" = "success" ] && RESULT="✅ SUCCESSFUL" || RESULT="⚠️ COMPLETED WITH WARNINGS"
+          
+          COMMENT="⬆️ QA PROMOTION ${RESULT}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 Final Status:
+• Image Tag: ${{ needs.detect-version.outputs.image_tag }}
+• Target: QA
+• Deployment: Canary (10% → 100%)
+
+🔗 Application URLs:
+• Vote: ${{ env.QA_URL }}
+• Results: ${{ env.QA_RESULTS_URL }}
+
+📊 Canary Status:
+• Initial weight: 10%
+• Final weight: 100% (if healthy)
+• Analysis: New Relic metrics
+
+🏗️ Architecture diagram generated in GitHub Actions summary."
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"${COMMENT}\"}" || true
+
+      - name: Generate Summary
+        env:
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+          TICKET_URL: ${{ needs.jira-create-ticket.outputs.ticket_url }}
+        run: |
+          echo "## ⬆️ QA Promotion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "$TICKET_KEY" ]; then
+            echo "### 🎫 Jira Tracking" >> $GITHUB_STEP_SUMMARY
+            echo "**Ticket:** [${TICKET_KEY}](${TICKET_URL})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag** | \`${{ needs.detect-version.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | QA |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Deployment Type** | Canary |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Promoted At** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Vote App | [${{ env.QA_URL }}](${{ env.QA_URL }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Results App | [${{ env.QA_RESULTS_URL }}](${{ env.QA_RESULTS_URL }}) |" >> $GITHUB_STEP_SUMMARY
+
       - name: Send Completion Notification
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+          TICKET_URL: ${{ needs.jira-create-ticket.outputs.ticket_url }}
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
           
           STATUS="${{ needs.deploy-qa.result }}"
           [ "$STATUS" = "success" ] && EMOJI="✅" && COLOR="good" || EMOJI="❌" && COLOR="danger"
+          
+          JIRA_BLOCK=""
+          [ -n "$TICKET_KEY" ] && JIRA_BLOCK=',{"type": "section", "text": {"type": "mrkdwn", "text": "🎫 *Jira:* <'"${TICKET_URL}"'|'"${TICKET_KEY}"'>"}}'
           
           curl -X POST -H 'Content-type: application/json' \
             --data '{
@@ -292,11 +747,12 @@ jobs:
                   {"type": "section", "fields": [
                     {"type": "mrkdwn", "text": "*Image Tag:*\n`'"${{ needs.detect-version.outputs.image_tag }}"'`"},
                     {"type": "mrkdwn", "text": "*Status:*\n'"${STATUS}"'"}
-                  ]},
+                  ]}'"${JIRA_BLOCK}"',
                   {"type": "section", "text": {"type": "mrkdwn", "text": "*Canary Deployment Started:*\n🐤 10% → 30% → 60% → 100%"}},
+                  {"type": "context", "elements": [{"type": "mrkdwn", "text": "📊 Architecture diagram available in <'"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"'|workflow summary>"}]},
                   {"type": "actions", "elements": [
                     {"type": "button", "text": {"type": "plain_text", "text": "📊 Monitor Canary"}, "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/50-cd-canary-monitor.yaml"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "🔍 View QA"}, "url": "https://opsera-voting-app-qa.agent.opsera.dev"}
+                    {"type": "button", "text": {"type": "plain_text", "text": "🔍 View QA"}, "url": "'"${{ env.QA_URL }}"'"}
                   ]}
                 ]
               }]

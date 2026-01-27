@@ -7,7 +7,8 @@
 # ║  • Link commits to Jira issues                                                 ║
 # ║  • Generate release notes                                                      ║
 # ║                                                                                ║
-# ║  Configure: Set JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN secrets         ║
+# ║  Configure: Set JIRA_BASE_URL, JIRA_API_TOKEN, JIRA_PROJECT_KEY secrets        ║
+# ║  Supports: Opsera Mock Jira (API Key auth) and Atlassian Cloud (Basic auth)    ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 name: "🎫 Ops: Jira Integration"
@@ -72,11 +73,11 @@ on:
 
 env:
   # Configure these secrets in GitHub:
-  # JIRA_BASE_URL: https://your-domain.atlassian.net
-  # JIRA_USER_EMAIL: your-email@domain.com
-  # JIRA_API_TOKEN: your-api-token
-  # JIRA_PROJECT_KEY: VOTE (or your project key)
-  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL || 'https://mock-jira.atlassian.net' }}
+  # JIRA_BASE_URL: https://opsera-jira-mock-labs.agent.opsera.dev (Mock) or https://your-domain.atlassian.net (Cloud)
+  # JIRA_API_TOKEN: API key (for Mock Jira) or API token (for Atlassian Cloud)
+  # JIRA_PROJECT_KEY: PR1 (or your project key)
+  # JIRA_USER_EMAIL: (optional, only needed for Atlassian Cloud basic auth)
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL || 'https://opsera-jira-mock-labs.agent.opsera.dev' }}
   APP_NAME: voting-app
 
 jobs:
@@ -106,16 +107,19 @@ jobs:
           JIRA_URL="${{ env.JIRA_BASE_URL }}"
           JIRA_EMAIL="${{ secrets.JIRA_USER_EMAIL }}"
           JIRA_TOKEN="${{ secrets.JIRA_API_TOKEN }}"
+          PROJECT_KEY="${{ secrets.JIRA_PROJECT_KEY }}"
           
-          # Check if secrets are configured
-          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_TOKEN" ]; then
+          # Check if API token is configured
+          if [ -z "$JIRA_TOKEN" ]; then
             echo "### ⚠️ Jira Not Configured" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "To enable Jira integration, configure these secrets:" >> $GITHUB_STEP_SUMMARY
-            echo "- \`JIRA_BASE_URL\`: Your Jira instance URL (e.g., https://your-domain.atlassian.net)" >> $GITHUB_STEP_SUMMARY
-            echo "- \`JIRA_USER_EMAIL\`: Your Jira account email" >> $GITHUB_STEP_SUMMARY
-            echo "- \`JIRA_API_TOKEN\`: API token from https://id.atlassian.com/manage-profile/security/api-tokens" >> $GITHUB_STEP_SUMMARY
-            echo "- \`JIRA_PROJECT_KEY\`: Your Jira project key (e.g., VOTE)" >> $GITHUB_STEP_SUMMARY
+            echo "- \`JIRA_BASE_URL\`: Your Jira instance URL" >> $GITHUB_STEP_SUMMARY
+            echo "  - Mock Jira: \`https://opsera-jira-mock-labs.agent.opsera.dev\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - Atlassian Cloud: \`https://your-domain.atlassian.net\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`JIRA_API_TOKEN\`: API key (Mock) or API token (Cloud)" >> $GITHUB_STEP_SUMMARY
+            echo "- \`JIRA_PROJECT_KEY\`: Your Jira project key (e.g., PR1, VOTE)" >> $GITHUB_STEP_SUMMARY
+            echo "- \`JIRA_USER_EMAIL\`: (Optional, only for Atlassian Cloud)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Once configured, Jira integration will:" >> $GITHUB_STEP_SUMMARY
             echo "- Create deployment tickets automatically" >> $GITHUB_STEP_SUMMARY
@@ -125,46 +129,72 @@ jobs:
             exit 0
           fi
           
-          # Test API connection
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
-            -H "Accept: application/json" \
-            "${JIRA_URL}/rest/api/3/myself")
+          # Determine auth method: Mock Jira uses X-API-Key, Atlassian uses basic auth
+          if [[ "$JIRA_URL" == *"opsera"* ]] || [[ "$JIRA_URL" == *"mock"* ]] || [ -z "$JIRA_EMAIL" ]; then
+            AUTH_HEADER="-H \"X-API-Key: ${JIRA_TOKEN}\""
+            AUTH_TYPE="API Key"
+            API_VERSION="2"
+          else
+            AUTH_HEADER="-u \"${JIRA_EMAIL}:${JIRA_TOKEN}\""
+            AUTH_TYPE="Basic Auth"
+            API_VERSION="3"
+          fi
           
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Jira URL | \`${JIRA_URL}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Auth Type | ${AUTH_TYPE} |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Version | v${API_VERSION} |" >> $GITHUB_STEP_SUMMARY
           
-          if [ "$HTTP_CODE" = "200" ]; then
-            DISPLAY_NAME=$(echo "$BODY" | jq -r '.displayName // "Unknown"')
-            EMAIL=$(echo "$BODY" | jq -r '.emailAddress // "Unknown"')
-            
-            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Status | ✅ Connected |" >> $GITHUB_STEP_SUMMARY
-            echo "| Jira URL | \`${JIRA_URL}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| User | ${DISPLAY_NAME} |" >> $GITHUB_STEP_SUMMARY
-            echo "| Email | ${EMAIL} |" >> $GITHUB_STEP_SUMMARY
-            
-            # Test project access
-            PROJECT_KEY="${{ secrets.JIRA_PROJECT_KEY }}"
-            if [ -n "$PROJECT_KEY" ]; then
+          # Test project access (this works for both Mock and Cloud)
+          if [ -n "$PROJECT_KEY" ]; then
+            if [ "$AUTH_TYPE" = "API Key" ]; then
+              PROJECT_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -H "X-API-Key: ${JIRA_TOKEN}" \
+                -H "Accept: application/json" \
+                "${JIRA_URL}/rest/api/2/project/${PROJECT_KEY}")
+            else
               PROJECT_RESPONSE=$(curl -s -w "\n%{http_code}" \
                 -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
                 -H "Accept: application/json" \
                 "${JIRA_URL}/rest/api/3/project/${PROJECT_KEY}")
-              
-              PROJECT_CODE=$(echo "$PROJECT_RESPONSE" | tail -n1)
-              if [ "$PROJECT_CODE" = "200" ]; then
-                PROJECT_NAME=$(echo "$PROJECT_RESPONSE" | head -n -1 | jq -r '.name // "Unknown"')
-                echo "| Project | ${PROJECT_NAME} (${PROJECT_KEY}) |" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "| Project | ⚠️ Cannot access ${PROJECT_KEY} |" >> $GITHUB_STEP_SUMMARY
-              fi
+            fi
+            
+            PROJECT_CODE=$(echo "$PROJECT_RESPONSE" | tail -n1)
+            if [ "$PROJECT_CODE" = "200" ]; then
+              PROJECT_NAME=$(echo "$PROJECT_RESPONSE" | head -n -1 | jq -r '.name // "Unknown"')
+              echo "| Project | ${PROJECT_NAME} (${PROJECT_KEY}) |" >> $GITHUB_STEP_SUMMARY
+              echo "| Status | ✅ Connected |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| Project | ⚠️ Cannot access ${PROJECT_KEY} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Status | ❌ Failed (HTTP ${PROJECT_CODE}) |" >> $GITHUB_STEP_SUMMARY
             fi
           else
-            echo "| Status | ❌ Failed (HTTP ${HTTP_CODE}) |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Error:** Check your JIRA_USER_EMAIL and JIRA_API_TOKEN secrets" >> $GITHUB_STEP_SUMMARY
+            # Test by listing projects
+            if [ "$AUTH_TYPE" = "API Key" ]; then
+              RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -H "X-API-Key: ${JIRA_TOKEN}" \
+                -H "Accept: application/json" \
+                "${JIRA_URL}/rest/api/2/project")
+            else
+              RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+                -H "Accept: application/json" \
+                "${JIRA_URL}/rest/api/3/project")
+            fi
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            if [ "$HTTP_CODE" = "200" ]; then
+              PROJECTS=$(echo "$RESPONSE" | head -n -1 | jq -r '.[].key' | tr '\n' ', ' | sed 's/,$//')
+              echo "| Projects | ${PROJECTS:-None found} |" >> $GITHUB_STEP_SUMMARY
+              echo "| Status | ✅ Connected |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> **Note:** Set \`JIRA_PROJECT_KEY\` secret to specify the default project" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| Status | ❌ Failed (HTTP ${HTTP_CODE}) |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Error:** Check your JIRA_API_TOKEN secret" >> $GITHUB_STEP_SUMMARY
+            fi
           fi
 
       # ════════════════════════════════════════════════════════════════════════════
@@ -183,95 +213,137 @@ jobs:
           PROJECT_KEY="${{ secrets.JIRA_PROJECT_KEY }}"
           ENV="${{ inputs.environment || github.event.inputs.environment }}"
           
-          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_TOKEN" ] || [ -z "$PROJECT_KEY" ]; then
+          if [ -z "$JIRA_TOKEN" ] || [ -z "$PROJECT_KEY" ]; then
             echo "⚠️ Jira not configured - skipping ticket creation" >> $GITHUB_STEP_SUMMARY
             echo "ticket_key=MOCK-001" >> $GITHUB_OUTPUT
-            echo "ticket_url=https://mock-jira.atlassian.net/browse/MOCK-001" >> $GITHUB_OUTPUT
+            echo "ticket_url=${JIRA_URL}/browse/MOCK-001" >> $GITHUB_OUTPUT
             exit 0
+          fi
+          
+          # Determine auth method: Mock Jira uses X-API-Key, Atlassian uses basic auth
+          if [[ "$JIRA_URL" == *"opsera"* ]] || [[ "$JIRA_URL" == *"mock"* ]] || [ -z "$JIRA_EMAIL" ]; then
+            USE_API_KEY=true
+            API_VERSION="2"
+          else
+            USE_API_KEY=false
+            API_VERSION="3"
           fi
           
           # Get commit info
           COMMIT_SHA="${GITHUB_SHA:0:7}"
-          COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -1 | sed 's/"/\\"/g')
           BRANCH="${GITHUB_REF_NAME}"
-          
-          # Create ticket
           TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST \
-            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            "${JIRA_URL}/rest/api/3/issue" \
-            -d "{
+          # Build description based on API version
+          if [ "$API_VERSION" = "2" ]; then
+            # API v2 uses plain text description
+            DESCRIPTION="Deployment triggered for ${ENV} environment
+          
+          Commit: ${COMMIT_SHA}
+          Branch: ${BRANCH}
+          Environment: ${ENV}
+          Triggered: ${TIMESTAMP}
+          Workflow: ${REPO_URL}/actions/runs/${GITHUB_RUN_ID}
+          
+          Commit Message: ${COMMIT_MSG}"
+            
+            PAYLOAD="{
               \"fields\": {
                 \"project\": { \"key\": \"${PROJECT_KEY}\" },
                 \"summary\": \"[Deploy] ${ENV^^}: ${COMMIT_SHA} - ${{ env.APP_NAME }}\",
-                \"description\": {
-                  \"type\": \"doc\",
-                  \"version\": 1,
-                  \"content\": [
-                    {
-                      \"type\": \"paragraph\",
-                      \"content\": [
-                        { \"type\": \"text\", \"text\": \"Deployment triggered for ${ENV} environment\" }
-                      ]
-                    },
-                    {
-                      \"type\": \"table\",
-                      \"content\": [
-                        {
-                          \"type\": \"tableRow\",
-                          \"content\": [
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Commit\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${COMMIT_SHA}\" }] }] }
-                          ]
-                        },
-                        {
-                          \"type\": \"tableRow\",
-                          \"content\": [
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Branch\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${BRANCH}\" }] }] }
-                          ]
-                        },
-                        {
-                          \"type\": \"tableRow\",
-                          \"content\": [
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Environment\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${ENV}\" }] }] }
-                          ]
-                        },
-                        {
-                          \"type\": \"tableRow\",
-                          \"content\": [
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Triggered\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
-                            { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${TIMESTAMP}\" }] }] }
-                          ]
-                        }
-                      ]
-                    },
-                    {
-                      \"type\": \"paragraph\",
-                      \"content\": [
-                        { \"type\": \"text\", \"text\": \"Commit Message: \", \"marks\": [{ \"type\": \"strong\" }] },
-                        { \"type\": \"text\", \"text\": \"${COMMIT_MSG}\" }
-                      ]
-                    }
-                  ]
-                },
+                \"description\": \"${DESCRIPTION}\",
                 \"issuetype\": { \"name\": \"Task\" },
-                \"labels\": [\"deployment\", \"${ENV}\", \"automated\"]
+                \"priority\": { \"name\": \"Medium\" }
               }
-            }")
+            }"
+            
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              -H "X-API-Key: ${JIRA_TOKEN}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "${JIRA_URL}/rest/api/2/issue" \
+              -d "${PAYLOAD}")
+          else
+            # API v3 uses Atlassian Document Format (ADF)
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "${JIRA_URL}/rest/api/3/issue" \
+              -d "{
+                \"fields\": {
+                  \"project\": { \"key\": \"${PROJECT_KEY}\" },
+                  \"summary\": \"[Deploy] ${ENV^^}: ${COMMIT_SHA} - ${{ env.APP_NAME }}\",
+                  \"description\": {
+                    \"type\": \"doc\",
+                    \"version\": 1,
+                    \"content\": [
+                      {
+                        \"type\": \"paragraph\",
+                        \"content\": [
+                          { \"type\": \"text\", \"text\": \"Deployment triggered for ${ENV} environment\" }
+                        ]
+                      },
+                      {
+                        \"type\": \"table\",
+                        \"content\": [
+                          {
+                            \"type\": \"tableRow\",
+                            \"content\": [
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Commit\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${COMMIT_SHA}\" }] }] }
+                            ]
+                          },
+                          {
+                            \"type\": \"tableRow\",
+                            \"content\": [
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Branch\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${BRANCH}\" }] }] }
+                            ]
+                          },
+                          {
+                            \"type\": \"tableRow\",
+                            \"content\": [
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Environment\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${ENV}\" }] }] }
+                            ]
+                          },
+                          {
+                            \"type\": \"tableRow\",
+                            \"content\": [
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"Triggered\", \"marks\": [{ \"type\": \"strong\" }] }] }] },
+                              { \"type\": \"tableCell\", \"content\": [{ \"type\": \"paragraph\", \"content\": [{ \"type\": \"text\", \"text\": \"${TIMESTAMP}\" }] }] }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        \"type\": \"paragraph\",
+                        \"content\": [
+                          { \"type\": \"text\", \"text\": \"Commit Message: \", \"marks\": [{ \"type\": \"strong\" }] },
+                          { \"type\": \"text\", \"text\": \"${COMMIT_MSG}\" }
+                        ]
+                      }
+                    ]
+                  },
+                  \"issuetype\": { \"name\": \"Task\" },
+                  \"labels\": [\"deployment\", \"${ENV}\", \"automated\"]
+                }
+              }")
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | head -n -1)
           
-          if [ "$HTTP_CODE" = "201" ]; then
+          # Check for success (201 for v3, 200 or 201 for v2)
+          if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
             TICKET_KEY=$(echo "$BODY" | jq -r '.key')
             TICKET_ID=$(echo "$BODY" | jq -r '.id')
-            TICKET_URL="${JIRA_URL}/browse/${TICKET_KEY}"
+            TICKET_URL="${JIRA_URL}/ui?issue=${TICKET_KEY}"
             
             echo "ticket_key=${TICKET_KEY}" >> $GITHUB_OUTPUT
             echo "ticket_url=${TICKET_URL}" >> $GITHUB_OUTPUT
@@ -306,7 +378,7 @@ jobs:
           TICKET_KEY="${{ inputs.ticket_key || github.event.inputs.ticket_key }}"
           STATUS="${{ inputs.status || 'Done' }}"
           
-          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_TOKEN" ]; then
+          if [ -z "$JIRA_TOKEN" ]; then
             echo "⚠️ Jira not configured - skipping update" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
@@ -316,52 +388,78 @@ jobs:
             exit 1
           fi
           
+          # Determine auth method
+          if [[ "$JIRA_URL" == *"opsera"* ]] || [[ "$JIRA_URL" == *"mock"* ]] || [ -z "$JIRA_EMAIL" ]; then
+            USE_API_KEY=true
+            API_VERSION="2"
+          else
+            USE_API_KEY=false
+            API_VERSION="3"
+          fi
+          
           # Get available transitions
-          TRANSITIONS=$(curl -s \
-            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
-            -H "Accept: application/json" \
-            "${JIRA_URL}/rest/api/3/issue/${TICKET_KEY}/transitions")
+          if [ "$USE_API_KEY" = true ]; then
+            TRANSITIONS=$(curl -s \
+              -H "X-API-Key: ${JIRA_TOKEN}" \
+              -H "Accept: application/json" \
+              "${JIRA_URL}/rest/api/2/issue/${TICKET_KEY}/transitions")
+          else
+            TRANSITIONS=$(curl -s \
+              -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -H "Accept: application/json" \
+              "${JIRA_URL}/rest/api/3/issue/${TICKET_KEY}/transitions")
+          fi
           
           # Find transition ID for target status
-          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | ascii_downcase == \"${STATUS}\" | ascii_downcase) | .id" | head -1)
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | ascii_downcase == \"${STATUS}\" | ascii_downcase) | .id" 2>/dev/null | head -1)
           
           if [ -z "$TRANSITION_ID" ] || [ "$TRANSITION_ID" = "null" ]; then
             # Try common status names
             case "${STATUS,,}" in
               "done"|"complete"|"completed")
-                TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("done|complete|closed"; "i")) | .id' | head -1)
+                TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("done|complete|closed"; "i")) | .id' 2>/dev/null | head -1)
                 ;;
               "in progress"|"in-progress")
-                TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("progress|started"; "i")) | .id' | head -1)
+                TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("progress|started"; "i")) | .id' 2>/dev/null | head -1)
                 ;;
               "failed"|"rejected")
-                TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("failed|rejected|cancelled"; "i")) | .id' | head -1)
+                TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("failed|rejected|cancelled"; "i")) | .id' 2>/dev/null | head -1)
                 ;;
             esac
           fi
           
+          TICKET_URL="${JIRA_URL}/ui?issue=${TICKET_KEY}"
+          
           if [ -n "$TRANSITION_ID" ] && [ "$TRANSITION_ID" != "null" ]; then
             # Execute transition
-            curl -s -X POST \
-              -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${JIRA_URL}/rest/api/3/issue/${TICKET_KEY}/transitions" \
-              -d "{ \"transition\": { \"id\": \"${TRANSITION_ID}\" } }"
+            if [ "$USE_API_KEY" = true ]; then
+              curl -s -X POST \
+                -H "X-API-Key: ${JIRA_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${JIRA_URL}/rest/api/2/issue/${TICKET_KEY}/transitions" \
+                -d "{ \"transition\": { \"id\": \"${TRANSITION_ID}\" } }"
+            else
+              curl -s -X POST \
+                -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${JIRA_URL}/rest/api/3/issue/${TICKET_KEY}/transitions" \
+                -d "{ \"transition\": { \"id\": \"${TRANSITION_ID}\" } }"
+            fi
             
             echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
             echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Ticket | [${TICKET_KEY}](${JIRA_URL}/browse/${TICKET_KEY}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Ticket | [${TICKET_KEY}](${TICKET_URL}) |" >> $GITHUB_STEP_SUMMARY
             echo "| New Status | ${STATUS} |" >> $GITHUB_STEP_SUMMARY
             echo "| Result | ✅ Updated |" >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ Could not find transition for status: ${STATUS}" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Available transitions:" >> $GITHUB_STEP_SUMMARY
-            echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name)"' >> $GITHUB_STEP_SUMMARY
+            echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name)"' 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "- None available" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "ticket_key=${TICKET_KEY}" >> $GITHUB_OUTPUT
-          echo "ticket_url=${JIRA_URL}/browse/${TICKET_KEY}" >> $GITHUB_OUTPUT
+          echo "ticket_url=${TICKET_URL}" >> $GITHUB_OUTPUT
 
       # ════════════════════════════════════════════════════════════════════════════
       # LINK COMMIT TO TICKET
@@ -377,7 +475,7 @@ jobs:
           JIRA_TOKEN="${{ secrets.JIRA_API_TOKEN }}"
           TICKET_KEY="${{ inputs.ticket_key || github.event.inputs.ticket_key }}"
           
-          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_TOKEN" ]; then
+          if [ -z "$JIRA_TOKEN" ]; then
             echo "⚠️ Jira not configured - skipping link" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
@@ -392,46 +490,69 @@ jobs:
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "To auto-link commits, include ticket key in commit message:" >> $GITHUB_STEP_SUMMARY
               echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-              echo "git commit -m \"VOTE-123: Fix button color\"" >> $GITHUB_STEP_SUMMARY
+              echo "git commit -m \"PR1-123: Fix button color\"" >> $GITHUB_STEP_SUMMARY
               echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
               exit 0
             fi
           fi
           
+          # Determine auth method
+          if [[ "$JIRA_URL" == *"opsera"* ]] || [[ "$JIRA_URL" == *"mock"* ]] || [ -z "$JIRA_EMAIL" ]; then
+            USE_API_KEY=true
+            API_VERSION="2"
+          else
+            USE_API_KEY=false
+            API_VERSION="3"
+          fi
+          
           COMMIT_SHA="${GITHUB_SHA}"
-          COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -1 | sed 's/"/\\"/g')
           REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          TICKET_URL="${JIRA_URL}/ui?issue=${TICKET_KEY}"
           
           # Add comment with commit link
-          curl -s -X POST \
-            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${JIRA_URL}/rest/api/3/issue/${TICKET_KEY}/comment" \
-            -d "{
-              \"body\": {
-                \"type\": \"doc\",
-                \"version\": 1,
-                \"content\": [
-                  {
-                    \"type\": \"paragraph\",
-                    \"content\": [
-                      { \"type\": \"text\", \"text\": \"Commit linked: \" },
-                      { \"type\": \"text\", \"text\": \"${COMMIT_SHA:0:7}\", \"marks\": [{ \"type\": \"link\", \"attrs\": { \"href\": \"${REPO_URL}/commit/${COMMIT_SHA}\" } }] }
-                    ]
-                  },
-                  {
-                    \"type\": \"paragraph\",
-                    \"content\": [
-                      { \"type\": \"text\", \"text\": \"Message: ${COMMIT_MSG}\" }
-                    ]
-                  }
-                ]
-              }
-            }"
+          if [ "$USE_API_KEY" = true ]; then
+            COMMENT_BODY="Commit linked: ${COMMIT_SHA:0:7}
+          
+          Commit URL: ${REPO_URL}/commit/${COMMIT_SHA}
+          Message: ${COMMIT_MSG}"
+            
+            curl -s -X POST \
+              -H "X-API-Key: ${JIRA_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${JIRA_URL}/rest/api/2/issue/${TICKET_KEY}/comment" \
+              -d "{\"body\": \"${COMMENT_BODY}\"}"
+          else
+            curl -s -X POST \
+              -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${JIRA_URL}/rest/api/3/issue/${TICKET_KEY}/comment" \
+              -d "{
+                \"body\": {
+                  \"type\": \"doc\",
+                  \"version\": 1,
+                  \"content\": [
+                    {
+                      \"type\": \"paragraph\",
+                      \"content\": [
+                        { \"type\": \"text\", \"text\": \"Commit linked: \" },
+                        { \"type\": \"text\", \"text\": \"${COMMIT_SHA:0:7}\", \"marks\": [{ \"type\": \"link\", \"attrs\": { \"href\": \"${REPO_URL}/commit/${COMMIT_SHA}\" } }] }
+                      ]
+                    },
+                    {
+                      \"type\": \"paragraph\",
+                      \"content\": [
+                        { \"type\": \"text\", \"text\": \"Message: ${COMMIT_MSG}\" }
+                      ]
+                    }
+                  ]
+                }
+              }"
+          fi
           
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Ticket | [${TICKET_KEY}](${JIRA_URL}/browse/${TICKET_KEY}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ticket | [${TICKET_KEY}](${TICKET_URL}) |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | [\`${COMMIT_SHA:0:7}\`](${REPO_URL}/commit/${COMMIT_SHA}) |" >> $GITHUB_STEP_SUMMARY
           echo "| Status | ✅ Linked |" >> $GITHUB_STEP_SUMMARY
 
@@ -445,6 +566,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           VERSION="${{ inputs.version || github.event.inputs.version }}"
+          JIRA_URL="${{ env.JIRA_BASE_URL }}"
           
           if [ -z "$VERSION" ]; then
             # Use latest tag or generate from date
@@ -481,12 +603,11 @@ jobs:
           
           # Extract Jira tickets
           echo "#### Linked Jira Tickets" >> $GITHUB_STEP_SUMMARY
-          JIRA_URL="${{ env.JIRA_BASE_URL }}"
           TICKETS=$(git log ${COMMIT_RANGE} --oneline | grep -oE '[A-Z]+-[0-9]+' | sort -u)
           
           if [ -n "$TICKETS" ]; then
             for TICKET in $TICKETS; do
-              echo "- [${TICKET}](${JIRA_URL}/browse/${TICKET})" >> $GITHUB_STEP_SUMMARY
+              echo "- [${TICKET}](${JIRA_URL}/ui?issue=${TICKET})" >> $GITHUB_STEP_SUMMARY
             done
           else
             echo "- No Jira tickets found in commit messages" >> $GITHUB_STEP_SUMMARY

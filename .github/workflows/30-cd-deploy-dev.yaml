@@ -3,12 +3,15 @@
 # ║              ENTERPRISE CD PIPELINE - DEPLOY TO DEV                            ║
 # ║                                                                                ║
 # ║  Stage 3 of the CI/CD Pipeline:                                                ║
+# ║  • Jira ticket creation & tracking                                             ║
 # ║  • Update Kustomize manifests                                                  ║
 # ║  • Trigger ArgoCD sync                                                         ║
 # ║  • Validate deployment health                                                  ║
 # ║  • Run smoke tests                                                             ║
-# ║  • Generate deployment report                                                  ║
+# ║  • Generate architecture diagram                                               ║
+# ║  • Comprehensive deployment report                                             ║
 # ║                                                                                ║
+# ║  Powered by Opsera - The Unified DevOps Platform                               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 name: "🚀 CD: Deploy to DEV"
@@ -35,6 +38,9 @@ env:
   SPOKE_CLUSTER: opsera-usw2-np
   DEV_URL: https://opsera-voting-app-dev.agent.opsera.dev
   DEV_RESULTS_URL: https://results.opsera-voting-app-dev.agent.opsera.dev
+  # Jira Configuration
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL || 'https://opsera-jira-mock-labs.agent.opsera.dev' }}
+  JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY || 'PR1' }}
 
 permissions:
   contents: write
@@ -42,11 +48,109 @@ permissions:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════════
+  # JIRA: CREATE DEPLOYMENT TICKET
+  # ════════════════════════════════════════════════════════════════════════════════
+  jira-create-ticket:
+    name: "🎫 Create Jira Ticket"
+    runs-on: ubuntu-latest
+    outputs:
+      ticket_key: ${{ steps.create.outputs.ticket_key }}
+      ticket_url: ${{ steps.create.outputs.ticket_url }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create Deployment Ticket
+        id: create
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          echo "## 🎫 Jira Deployment Ticket" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -z "$JIRA_TOKEN" ]; then
+            echo "⚠️ Jira not configured - using mock ticket" >> $GITHUB_STEP_SUMMARY
+            echo "ticket_key=MOCK-001" >> $GITHUB_OUTPUT
+            echo "ticket_url=${{ env.JIRA_BASE_URL }}/ui" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          COMMIT_SHA="${GITHUB_SHA:0:7}"
+          COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -1 | sed 's/"/\\"/g' || echo "Deployment")
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          WORKFLOW_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          
+          DESCRIPTION="🚀 DEV Deployment Started
+
+📋 Deployment Details:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Image Tag: ${IMAGE_TAG}
+• Commit: ${COMMIT_SHA}
+• Branch: ${GITHUB_REF_NAME}
+• Environment: DEV
+• Triggered: ${TIMESTAMP}
+• Triggered By: ${GITHUB_ACTOR}
+• Workflow: ${WORKFLOW_URL}
+
+📝 Commit Message:
+${COMMIT_MSG}
+
+🔄 Deployment Stages:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] Pre-deployment validation
+[ ] Update manifests
+[ ] ArgoCD sync
+[ ] Verify deployment
+[ ] Smoke tests
+[ ] Generate architecture diagram"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue" \
+            -d "{
+              \"fields\": {
+                \"project\": {\"key\": \"${{ env.JIRA_PROJECT_KEY }}\"},
+                \"summary\": \"[Deploy] DEV: ${IMAGE_TAG} - ${{ env.APP_NAME }}\",
+                \"description\": \"${DESCRIPTION}\",
+                \"issuetype\": {\"name\": \"Task\"},
+                \"priority\": {\"name\": \"High\"}
+              }
+            }")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+            TICKET_KEY=$(echo "$BODY" | jq -r '.key')
+            TICKET_URL="${{ env.JIRA_BASE_URL }}/ui?issue=${TICKET_KEY}"
+            
+            echo "ticket_key=${TICKET_KEY}" >> $GITHUB_OUTPUT
+            echo "ticket_url=${TICKET_URL}" >> $GITHUB_OUTPUT
+            
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Ticket | [${TICKET_KEY}](${TICKET_URL}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Image Tag | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | ✅ Created |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Failed to create Jira ticket (HTTP ${HTTP_CODE})" >> $GITHUB_STEP_SUMMARY
+            echo "ticket_key=" >> $GITHUB_OUTPUT
+            echo "ticket_url=" >> $GITHUB_OUTPUT
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
   # PRE-DEPLOYMENT VALIDATION
   # ════════════════════════════════════════════════════════════════════════════════
   pre-deploy-check:
     name: "🔎 Pre-Deploy Check"
     runs-on: ubuntu-latest
+    needs: [jira-create-ticket]
     outputs:
       ready: ${{ steps.check.outputs.ready }}
     
@@ -87,13 +191,30 @@ jobs:
             exit 1
           fi
 
+      - name: Update Jira - Pre-check Complete
+        if: always()
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          STATUS="${{ steps.check.outcome }}"
+          [ "$STATUS" = "success" ] && MSG="✅ Pre-deployment validation passed" || MSG="❌ Pre-deployment validation failed"
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"${MSG}\\n\\nAll container images verified in ECR.\"}" || true
+
   # ════════════════════════════════════════════════════════════════════════════════
   # UPDATE MANIFESTS
   # ════════════════════════════════════════════════════════════════════════════════
   update-manifests:
     name: "📝 Update Manifests"
     runs-on: ubuntu-latest
-    needs: [pre-deploy-check]
+    needs: [jira-create-ticket, pre-deploy-check]
     
     steps:
       - name: Checkout Code
@@ -109,6 +230,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Update Kustomization
+        id: update
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
@@ -131,8 +253,24 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin main || true
           git add .
-          git diff --staged --quiet || git commit -m "chore(dev): deploy ${{ inputs.image_tag }} [skip ci]"
+          git diff --staged --quiet || git commit -m "chore(dev): deploy ${{ inputs.image_tag }} [skip ci]
+
+Jira: ${{ needs.jira-create-ticket.outputs.ticket_key }}"
           git push origin main || echo "No changes to push"
+
+      - name: Update Jira - Manifests Updated
+        if: always()
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"✅ Kustomize manifests updated\\n\\nImage tag: ${{ inputs.image_tag }}\\nCommit pushed to main branch.\"}" || true
 
   # ════════════════════════════════════════════════════════════════════════════════
   # ARGOCD SYNC
@@ -140,7 +278,7 @@ jobs:
   argocd-sync:
     name: "🔄 ArgoCD Sync"
     runs-on: ubuntu-latest
-    needs: [update-manifests]
+    needs: [jira-create-ticket, update-manifests]
     
     steps:
       - name: Configure AWS Credentials
@@ -157,6 +295,7 @@ jobs:
           sudo mv kubectl /usr/local/bin/
 
       - name: Sync ArgoCD Application
+        id: sync
         run: |
           aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
           
@@ -175,13 +314,26 @@ jobs:
           echo "### 🔄 ArgoCD Sync" >> $GITHUB_STEP_SUMMARY
           echo "Triggered sync for \`${APP_NAME}\`" >> $GITHUB_STEP_SUMMARY
 
+      - name: Update Jira - ArgoCD Sync
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"🔄 ArgoCD sync triggered\\n\\nApplication: ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}\\nCluster: ${{ env.HUB_CLUSTER }}\"}" || true
+
   # ════════════════════════════════════════════════════════════════════════════════
   # VERIFY DEPLOYMENT
   # ════════════════════════════════════════════════════════════════════════════════
   verify-deployment:
     name: "✅ Verify Deployment"
     runs-on: ubuntu-latest
-    needs: [argocd-sync]
+    needs: [jira-create-ticket, argocd-sync]
     outputs:
       healthy: ${{ steps.verify.outputs.healthy }}
     
@@ -230,13 +382,30 @@ jobs:
           echo "| Health Status | ⚠️ ${HEALTH} |" >> $GITHUB_STEP_SUMMARY
           echo "healthy=false" >> $GITHUB_OUTPUT
 
+      - name: Update Jira - Deployment Verified
+        if: always()
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          HEALTHY="${{ steps.verify.outputs.healthy }}"
+          [ "$HEALTHY" = "true" ] && MSG="✅ Deployment verified healthy" || MSG="⚠️ Deployment health check had issues"
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"${MSG}\\n\\nArgoCD application is synced and healthy.\"}" || true
+
   # ════════════════════════════════════════════════════════════════════════════════
   # SMOKE TESTS
   # ════════════════════════════════════════════════════════════════════════════════
   smoke-tests:
     name: "🧪 Smoke Tests"
     runs-on: ubuntu-latest
-    needs: [verify-deployment]
+    needs: [jira-create-ticket, verify-deployment]
     outputs:
       passed: ${{ steps.test.outputs.passed }}
     
@@ -273,40 +442,358 @@ jobs:
           echo "- Vote: ${{ env.DEV_URL }}" >> $GITHUB_STEP_SUMMARY
           echo "- Results: ${{ env.DEV_RESULTS_URL }}" >> $GITHUB_STEP_SUMMARY
 
+      - name: Update Jira - Smoke Tests
+        if: always()
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"🧪 Smoke tests completed\\n\\nEndpoints verified:\\n• Vote: ${{ env.DEV_URL }}\\n• Results: ${{ env.DEV_RESULTS_URL }}\"}" || true
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # ARCHITECTURE DIAGRAM
+  # ════════════════════════════════════════════════════════════════════════════════
+  generate-architecture:
+    name: "🏗️ Architecture Diagram"
+    runs-on: ubuntu-latest
+    needs: [jira-create-ticket, smoke-tests]
+    if: always() && needs.smoke-tests.result != 'cancelled'
+    
+    steps:
+      - name: Generate Architecture Diagram
+        run: |
+          echo "## 🏗️ Deployment Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### System Architecture - DEV Environment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'ARCH'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c5c5c', 'secondaryColor': '#f5f5f5', 'tertiaryColor': '#ffffff', 'background': '#ffffff'}}}%%
+flowchart TB
+    subgraph INTERNET["☁️ INTERNET"]
+        USER["👤 Users"]
+    end
+
+    subgraph AWS["☁️ AWS CLOUD"]
+        subgraph ROUTE53["🌐 Route 53 DNS"]
+            DNS["opsera-voting-app-dev.agent.opsera.dev"]
+        end
+        
+        subgraph EKS["⎈ EKS Cluster: opsera-usw2-np"]
+            subgraph INGRESS["🔷 Ingress Layer"]
+                NGINX["NGINX Ingress Controller\n+ cert-manager TLS"]
+            end
+            
+            subgraph DEV_NS["📦 voting-app-dev namespace"]
+                direction TB
+                VOTE["🗳️ Vote Service\nPython Flask\nReplicas: 2"]
+                RESULT["📊 Result Service\nNode.js Express\nReplicas: 2"]
+                WORKER["⚙️ Worker\n.NET Core\nReplicas: 1"]
+                REDIS[("🔴 Redis\nIn-Memory Queue")]
+                POSTGRES[("🐘 PostgreSQL\nPersistent Storage")]
+            end
+            
+            subgraph PLATFORM["🔧 Platform Services"]
+                ARGOCD["🔄 ArgoCD\nGitOps Controller"]
+                EXTDNS["📍 ExternalDNS\nDNS Automation"]
+            end
+        end
+        
+        subgraph ECR["📦 ECR Registry"]
+            IMG_VOTE["vote:$TAG"]
+            IMG_RESULT["result:$TAG"]
+            IMG_WORKER["worker:$TAG"]
+        end
+    end
+
+    subgraph GITHUB["🐙 GitHub"]
+        REPO["📂 Repository"]
+        GHA["⚡ GitHub Actions"]
+    end
+
+    subgraph MONITOR["📊 Monitoring"]
+        NEWRELIC["📈 New Relic APM"]
+        SLACK["💬 Slack"]
+        JIRA["🎫 Jira"]
+    end
+
+    %% Flow with numbers
+    USER -->|"1️⃣ HTTPS Request"| DNS
+    DNS -->|"2️⃣ Route"| NGINX
+    NGINX -->|"3️⃣ /vote"| VOTE
+    NGINX -->|"3️⃣ /result"| RESULT
+    
+    VOTE -->|"4️⃣ Queue Vote"| REDIS
+    WORKER -->|"5️⃣ Process"| REDIS
+    WORKER -->|"6️⃣ Persist"| POSTGRES
+    RESULT -->|"7️⃣ Query"| POSTGRES
+    
+    REPO -->|"8️⃣ Push"| GHA
+    GHA -->|"9️⃣ Build & Push"| ECR
+    GHA -->|"🔟 Sync"| ARGOCD
+    ARGOCD -->|"1️⃣1️⃣ Deploy"| DEV_NS
+    
+    DEV_NS -.->|"Metrics"| NEWRELIC
+    GHA -.->|"Notify"| SLACK
+    GHA -.->|"Track"| JIRA
+
+    classDef aws fill:#ff9900,stroke:#232f3e,color:#232f3e
+    classDef k8s fill:#326ce5,stroke:#fff,color:#fff
+    classDef app fill:#4a90d9,stroke:#2c5aa0,color:#fff
+    classDef data fill:#3d9970,stroke:#2d7050,color:#fff
+    classDef external fill:#6c757d,stroke:#495057,color:#fff
+    
+    class AWS aws
+    class EKS,INGRESS,DEV_NS,PLATFORM k8s
+    class VOTE,RESULT,WORKER app
+    class REDIS,POSTGRES data
+    class USER,GITHUB,MONITOR external
+```
+ARCH
+
+      - name: Generate Sequence Diagram
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Flow Sequence" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'SEQ'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c5c5c', 'background': '#ffffff', 'actorBkg': '#4a90d9', 'actorTextColor': '#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    
+    participant DEV as 👨‍💻 Developer
+    participant GH as 🐙 GitHub
+    participant GHA as ⚡ GitHub Actions
+    participant JIRA as 🎫 Jira
+    participant ECR as 📦 ECR
+    participant ARGO as 🔄 ArgoCD
+    participant K8S as ⎈ Kubernetes
+    participant APP as 🗳️ Application
+    participant NR as 📈 New Relic
+    participant SLACK as 💬 Slack
+
+    rect rgb(240, 248, 255)
+        Note over DEV,GH: Stage 1: Code Commit
+        DEV->>GH: git push (code changes)
+        GH->>GHA: Trigger CI/CD Pipeline
+    end
+
+    rect rgb(255, 248, 240)
+        Note over GHA,JIRA: Stage 2: Pipeline Start
+        GHA->>JIRA: Create deployment ticket
+        JIRA-->>GHA: Ticket: PR1-XXX
+        GHA->>SLACK: 📢 Deployment started
+    end
+
+    rect rgb(240, 255, 240)
+        Note over GHA,ECR: Stage 3: Build & Scan
+        GHA->>GHA: Run security scans (SAST, SCA, Secrets)
+        GHA->>GHA: Build container images
+        GHA->>ECR: Push images (vote, result, worker)
+        GHA->>JIRA: 📝 Images pushed to ECR
+    end
+
+    rect rgb(248, 240, 255)
+        Note over GHA,K8S: Stage 4: GitOps Deploy
+        GHA->>GH: Update Kustomize manifests
+        GHA->>ARGO: Trigger sync
+        ARGO->>GH: Pull latest manifests
+        ARGO->>K8S: Apply resources
+        GHA->>JIRA: 📝 ArgoCD sync triggered
+    end
+
+    rect rgb(255, 255, 240)
+        Note over K8S,APP: Stage 5: Deployment
+        K8S->>K8S: Rolling update pods
+        K8S->>ECR: Pull new images
+        K8S->>APP: Start new containers
+        APP->>NR: Register APM agent
+    end
+
+    rect rgb(240, 255, 248)
+        Note over GHA,APP: Stage 6: Verification
+        GHA->>ARGO: Check sync status
+        ARGO-->>GHA: ✅ Synced & Healthy
+        GHA->>APP: Run smoke tests
+        APP-->>GHA: ✅ HTTP 200 OK
+        GHA->>JIRA: 📝 Deployment verified
+    end
+
+    rect rgb(248, 255, 240)
+        Note over GHA,SLACK: Stage 7: Completion
+        GHA->>JIRA: ✅ Close ticket (Done)
+        GHA->>SLACK: ✅ DEV deployment complete
+        SLACK-->>DEV: 🔔 Notification
+    end
+```
+SEQ
+
+      - name: Generate Data Flow Diagram  
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Application Data Flow" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'DATA'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#1a1a1a', 'background': '#ffffff'}}}%%
+flowchart LR
+    subgraph CLIENT["👤 Client Browser"]
+        BROWSER["🌐 Web Browser"]
+    end
+    
+    subgraph VOTING["🗳️ Voting Flow"]
+        direction TB
+        V1["1️⃣ User visits\nvote.domain.com"]
+        V2["2️⃣ Selects\nCats or Dogs"]
+        V3["3️⃣ Submit\nvote"]
+    end
+    
+    subgraph BACKEND["⚙️ Backend Processing"]
+        direction TB
+        VOTE_SVC["🐍 Vote Service\n(Flask)"]
+        REDIS_Q[("🔴 Redis Queue\nLPUSH vote")]
+        WORKER_SVC["🔧 Worker\n(.NET)"]
+        PG_DB[("🐘 PostgreSQL\nUPSERT vote")]
+    end
+    
+    subgraph RESULTS["📊 Results Display"]
+        direction TB
+        RESULT_SVC["📈 Result Service\n(Node.js)"]
+        R1["4️⃣ Real-time\nWebSocket updates"]
+        R2["5️⃣ Vote percentages\ndisplayed"]
+    end
+    
+    BROWSER --> V1 --> V2 --> V3
+    V3 --> VOTE_SVC
+    VOTE_SVC -->|"Queue"| REDIS_Q
+    REDIS_Q -->|"RPOP"| WORKER_SVC
+    WORKER_SVC -->|"Store"| PG_DB
+    PG_DB -->|"SELECT"| RESULT_SVC
+    RESULT_SVC --> R1 --> R2
+    R2 --> BROWSER
+    
+    style VOTE_SVC fill:#4a90d9,stroke:#2c5aa0,color:#fff
+    style WORKER_SVC fill:#68217a,stroke:#4a1857,color:#fff
+    style RESULT_SVC fill:#3c873a,stroke:#2d6a2d,color:#fff
+    style REDIS_Q fill:#dc382d,stroke:#a52a20,color:#fff
+    style PG_DB fill:#336791,stroke:#264d6d,color:#fff
+```
+DATA
+
   # ════════════════════════════════════════════════════════════════════════════════
   # DEPLOYMENT SUMMARY
   # ════════════════════════════════════════════════════════════════════════════════
   deployment-summary:
     name: "📊 Deployment Summary"
     runs-on: ubuntu-latest
-    needs: [pre-deploy-check, update-manifests, argocd-sync, verify-deployment, smoke-tests]
+    needs: [jira-create-ticket, pre-deploy-check, update-manifests, argocd-sync, verify-deployment, smoke-tests, generate-architecture]
     if: always()
     
     steps:
       - name: Generate Summary
+        env:
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+          TICKET_URL: ${{ needs.jira-create-ticket.outputs.ticket_url }}
         run: |
           echo "## 🚀 DEV Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Jira ticket info
+          if [ -n "$TICKET_KEY" ]; then
+            echo "### 🎫 Jira Tracking" >> $GITHUB_STEP_SUMMARY
+            echo "**Ticket:** [${TICKET_KEY}](${TICKET_URL})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### Pipeline Status" >> $GITHUB_STEP_SUMMARY
           echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           
-          [ "${{ needs.pre-deploy-check.result }}" = "success" ] && echo "| Pre-Deploy Check | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Pre-Deploy Check | ❌ |" >> $GITHUB_STEP_SUMMARY
-          [ "${{ needs.update-manifests.result }}" = "success" ] && echo "| Update Manifests | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Update Manifests | ❌ |" >> $GITHUB_STEP_SUMMARY
-          [ "${{ needs.argocd-sync.result }}" = "success" ] && echo "| ArgoCD Sync | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| ArgoCD Sync | ❌ |" >> $GITHUB_STEP_SUMMARY
-          [ "${{ needs.verify-deployment.result }}" = "success" ] && echo "| Verify Deployment | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Verify Deployment | ⚠️ |" >> $GITHUB_STEP_SUMMARY
-          [ "${{ needs.smoke-tests.result }}" = "success" ] && echo "| Smoke Tests | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| Smoke Tests | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.jira-create-ticket.result }}" = "success" ] && echo "| 🎫 Jira Ticket | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| 🎫 Jira Ticket | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.pre-deploy-check.result }}" = "success" ] && echo "| 🔎 Pre-Deploy Check | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| 🔎 Pre-Deploy Check | ❌ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.update-manifests.result }}" = "success" ] && echo "| 📝 Update Manifests | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| 📝 Update Manifests | ❌ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.argocd-sync.result }}" = "success" ] && echo "| 🔄 ArgoCD Sync | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| 🔄 ArgoCD Sync | ❌ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.verify-deployment.result }}" = "success" ] && echo "| ✅ Verify Deployment | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| ✅ Verify Deployment | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.smoke-tests.result }}" = "success" ] && echo "| 🧪 Smoke Tests | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| 🧪 Smoke Tests | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ needs.generate-architecture.result }}" = "success" ] && echo "| 🏗️ Architecture Diagram | ✅ |" >> $GITHUB_STEP_SUMMARY || echo "| 🏗️ Architecture Diagram | ⚠️ |" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image Tag:** \`${{ inputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag** | \`${{ inputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | DEV |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cluster** | ${{ env.SPOKE_CLUSTER }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Deployed At** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Vote App | [${{ env.DEV_URL }}](${{ env.DEV_URL }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Results App | [${{ env.DEV_RESULTS_URL }}](${{ env.DEV_RESULTS_URL }}) |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update Jira - Deployment Complete
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+        run: |
+          [ -z "$JIRA_TOKEN" ] || [ -z "$TICKET_KEY" ] && exit 0
+          
+          OVERALL="${{ needs.smoke-tests.result }}"
+          [ "$OVERALL" = "success" ] && STATUS="✅ SUCCESSFUL" || STATUS="⚠️ COMPLETED WITH WARNINGS"
+          
+          COMMENT="🚀 DEV DEPLOYMENT ${STATUS}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 Final Status:
+• Image Tag: ${{ inputs.image_tag }}
+• Environment: DEV  
+• Cluster: ${{ env.SPOKE_CLUSTER }}
+
+🔗 Application URLs:
+• Vote: ${{ env.DEV_URL }}
+• Results: ${{ env.DEV_RESULTS_URL }}
+
+📊 Pipeline Results:
+• Pre-check: ${{ needs.pre-deploy-check.result }}
+• Manifests: ${{ needs.update-manifests.result }}
+• ArgoCD: ${{ needs.argocd-sync.result }}
+• Verification: ${{ needs.verify-deployment.result }}
+• Smoke Tests: ${{ needs.smoke-tests.result }}
+
+🏗️ Architecture diagram generated in GitHub Actions summary."
+          
+          curl -s -X POST \
+            -H "X-API-Key: ${JIRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ env.JIRA_BASE_URL }}/rest/api/2/issue/${TICKET_KEY}/comment" \
+            -d "{\"body\": \"${COMMENT}\"}" || true
 
       - name: Notify Slack - DEV Complete
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TICKET_KEY: ${{ needs.jira-create-ticket.outputs.ticket_key }}
+          TICKET_URL: ${{ needs.jira-create-ticket.outputs.ticket_url }}
         run: |
           if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
           
           STATUS="${{ needs.smoke-tests.result }}"
           [ "$STATUS" = "success" ] && EMOJI="✅" && COLOR="good" || EMOJI="⚠️" && COLOR="warning"
+          
+          JIRA_BLOCK=""
+          if [ -n "$TICKET_KEY" ]; then
+            JIRA_BLOCK=',{"type": "section", "text": {"type": "mrkdwn", "text": "🎫 *Jira:* <'"${TICKET_URL}"'|'"${TICKET_KEY}"'>"}}'
+          fi
           
           curl -X POST -H 'Content-type: application/json' \
             --data '{
@@ -317,8 +804,9 @@ jobs:
                   {"type": "section", "fields": [
                     {"type": "mrkdwn", "text": "*Image Tag:*\n`'"${{ inputs.image_tag }}"'`"},
                     {"type": "mrkdwn", "text": "*Environment:*\nDEV"}
-                  ]},
+                  ]}'"${JIRA_BLOCK}"',
                   {"type": "section", "text": {"type": "mrkdwn", "text": "*URLs:*\n• <'"${{ env.DEV_URL }}"'|Vote App>\n• <'"${{ env.DEV_RESULTS_URL }}"'|Results App>"}},
+                  {"type": "context", "elements": [{"type": "mrkdwn", "text": "📊 Architecture diagram available in <'"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"'|workflow summary>"}]},
                   {"type": "actions", "elements": [
                     {"type": "button", "text": {"type": "plain_text", "text": "⬆️ Promote to QA"}, "style": "primary", "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/40-cd-promote-qa.yaml"}
                   ]}

@@ -1,13 +1,16 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  ARCHITECTURE DIAGRAM GENERATOR                                               ║
+# ║  ARCHITECTURE DIAGRAM GENERATOR - Enterprise Edition                          ║
 # ║                                                                                ║
-# ║  Generates deployment architecture diagrams:                                   ║
+# ║  Generates professional deployment architecture diagrams:                      ║
+# ║  • White background with clean styling                                         ║
+# ║  • Service icons and numbered flow                                             ║
 # ║  • Kubernetes resource topology                                                ║
-# ║  • Service dependencies                                                        ║
-# ║  • Network flow visualization                                                  ║
-# ║  • CI/CD pipeline diagram                                                      ║
+# ║  • CI/CD pipeline visualization                                                ║
+# ║  • Sequence diagrams for deployment flows                                      ║
+# ║  • Data flow diagrams                                                          ║
 # ║                                                                                ║
-# ║  Output formats: Mermaid, ASCII, DOT (Graphviz)                                ║
+# ║  Output: Mermaid diagrams in GitHub Actions Summary                            ║
+# ║  Powered by Opsera - The Unified DevOps Platform                               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 name: "🎨 Ops: Architecture Diagram"
@@ -20,35 +23,49 @@ on:
         required: true
         type: choice
         options:
+          - all
           - deployment-architecture
           - kubernetes-topology
           - ci-cd-pipeline
+          - sequence-diagram
           - data-flow
-          - all
-        default: 'deployment-architecture'
+        default: 'all'
       environment:
         description: 'Environment to visualize'
         required: true
         type: choice
         options:
+          - all
           - dev
           - qa
-          - all
         default: 'all'
-      output_format:
-        description: 'Output format'
-        required: true
-        type: choice
-        options:
-          - mermaid
-          - ascii
-          - summary
-        default: 'mermaid'
+  
+  # Can be called by other workflows
+  workflow_call:
+    inputs:
+      diagram_type:
+        description: 'Diagram type'
+        required: false
+        type: string
+        default: 'all'
+      environment:
+        description: 'Environment to visualize'
+        required: false
+        type: string
+        default: 'all'
+      image_tag:
+        description: 'Current image tag'
+        required: false
+        type: string
+        default: 'latest'
 
 env:
   AWS_REGION: us-west-2
   SPOKE_CLUSTER: opsera-usw2-np
+  HUB_CLUSTER: argocd-usw2
   APP_NAME: voting-app
+  DEV_URL: https://opsera-voting-app-dev.agent.opsera.dev
+  QA_URL: https://opsera-voting-app-qa.agent.opsera.dev
 
 permissions:
   contents: read
@@ -78,117 +95,475 @@ jobs:
 
       - name: Connect to Cluster
         run: |
-          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }} || true
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # HEADER
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "📋 Generate Header"
+        run: |
+          DIAGRAM_TYPE="${{ inputs.diagram_type || github.event.inputs.diagram_type || 'all' }}"
+          
+          echo "# 🏗️ Voting App Architecture Diagrams" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Diagram Type:** ${DIAGRAM_TYPE}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
 
       # ════════════════════════════════════════════════════════════════════════════
       # DEPLOYMENT ARCHITECTURE
       # ════════════════════════════════════════════════════════════════════════════
       - name: "🏗️ Generate Deployment Architecture"
-        if: inputs.diagram_type == 'deployment-architecture' || inputs.diagram_type == 'all'
+        if: inputs.diagram_type == 'deployment-architecture' || inputs.diagram_type == 'all' || github.event.inputs.diagram_type == 'deployment-architecture' || github.event.inputs.diagram_type == 'all'
         run: |
-          echo "## 🏗️ Deployment Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🏗️ System Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Enterprise deployment architecture with numbered flow showing the complete request path from users to backend services." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ inputs.output_format }}" = "mermaid" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'MERMAID'
-          ```mermaid
-          graph TB
-              subgraph "Internet"
-                  USER[("👤 Users")]
-              end
-              
-              subgraph "AWS Cloud"
-                  subgraph "Route53"
-                      DNS_DEV["🌐 opsera-voting-app-dev.agent.opsera.dev"]
-                      DNS_QA["🌐 opsera-voting-app-qa.agent.opsera.dev"]
-                  end
-                  
-                  subgraph "EKS Cluster: opsera-usw2-np"
-                      subgraph "ingress-nginx namespace"
-                          NGINX["🔷 NGINX Ingress Controller<br/>+ cert-manager TLS"]
-                      end
-                      
-                      subgraph "voting-app-dev namespace"
-                          VOTE_DEV["🗳️ Vote Service<br/>(Python Flask)"]
-                          RESULT_DEV["📊 Result Service<br/>(Node.js)"]
-                          WORKER_DEV["⚙️ Worker<br/>(.NET)"]
-                          REDIS_DEV[("🔴 Redis<br/>Queue")]
-                          DB_DEV[("🐘 PostgreSQL<br/>Database")]
-                      end
-                      
-                      subgraph "voting-app-qa namespace"
-                          VOTE_QA["🗳️ Vote Service<br/>(Canary)"]
-                          RESULT_QA["📊 Result Service"]
-                          WORKER_QA["⚙️ Worker"]
-                          REDIS_QA[("🔴 Redis")]
-                          DB_QA[("🐘 PostgreSQL")]
-                      end
-                      
-                      subgraph "argocd namespace"
-                          ARGOCD["🔄 ArgoCD<br/>GitOps Controller"]
-                      end
-                      
-                      subgraph "argo-rollouts namespace"
-                          ROLLOUTS["📈 Argo Rollouts<br/>Canary Controller"]
-                      end
-                  end
-                  
-                  subgraph "ECR"
-                      ECR_VOTE["📦 vote:tag"]
-                      ECR_RESULT["📦 result:tag"]
-                      ECR_WORKER["📦 worker:tag"]
-                  end
-              end
-              
-              subgraph "GitHub"
-                  REPO["📂 Repository"]
-                  ACTIONS["⚡ GitHub Actions<br/>CI/CD Pipeline"]
-              end
-              
-              subgraph "Monitoring"
-                  NR["📊 New Relic<br/>APM & Metrics"]
-                  SLACK["💬 Slack<br/>Notifications"]
-              end
-              
-              USER --> DNS_DEV & DNS_QA
-              DNS_DEV --> NGINX
-              DNS_QA --> NGINX
-              NGINX --> VOTE_DEV & RESULT_DEV
-              NGINX --> VOTE_QA & RESULT_QA
-              
-              VOTE_DEV --> REDIS_DEV
-              WORKER_DEV --> REDIS_DEV
-              WORKER_DEV --> DB_DEV
-              RESULT_DEV --> DB_DEV
-              
-              VOTE_QA --> REDIS_QA
-              WORKER_QA --> REDIS_QA
-              WORKER_QA --> DB_QA
-              RESULT_QA --> DB_QA
-              
-              REPO --> ACTIONS
-              ACTIONS --> ECR_VOTE & ECR_RESULT & ECR_WORKER
-              ACTIONS --> ARGOCD
-              ARGOCD --> VOTE_DEV & VOTE_QA
-              ROLLOUTS --> VOTE_QA
-              
-              VOTE_DEV & VOTE_QA -.-> NR
-              ACTIONS -.-> SLACK
-          ```
-          MERMAID
-          fi
+          cat >> $GITHUB_STEP_SUMMARY << 'ARCH'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4285f4', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#1a73e8', 'lineColor': '#5f6368', 'secondaryColor': '#f8f9fa', 'tertiaryColor': '#ffffff', 'background': '#ffffff', 'mainBkg': '#ffffff', 'nodeBorder': '#dadce0'}}}%%
+flowchart TB
+    %% Styling
+    classDef userStyle fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#1a1a1a
+    classDef awsStyle fill:#ff9900,stroke:#232f3e,stroke-width:2px,color:#232f3e
+    classDef k8sStyle fill:#326ce5,stroke:#ffffff,stroke-width:2px,color:#ffffff
+    classDef appStyle fill:#4285f4,stroke:#1a73e8,stroke-width:2px,color:#ffffff
+    classDef dataStyle fill:#34a853,stroke:#1e8e3e,stroke-width:2px,color:#ffffff
+    classDef cicdStyle fill:#9334e6,stroke:#7627bb,stroke-width:2px,color:#ffffff
+    classDef monitorStyle fill:#ea4335,stroke:#c5221f,stroke-width:2px,color:#ffffff
+
+    subgraph INTERNET["☁️ Internet"]
+        USER["👤 End Users"]
+    end
+
+    subgraph AWS["☁️ AWS Cloud (us-west-2)"]
+        subgraph DNS["🌐 Route 53"]
+            R53_DEV["📍 opsera-voting-app-dev\n.agent.opsera.dev"]
+            R53_QA["📍 opsera-voting-app-qa\n.agent.opsera.dev"]
+        end
+
+        subgraph EKS["⎈ Amazon EKS Cluster"]
+            subgraph INGRESS_NS["Namespace: ingress-nginx"]
+                ALB["🔷 Application Load Balancer"]
+                NGINX["🔷 NGINX Ingress Controller\n+ cert-manager (TLS)"]
+            end
+
+            subgraph DEV_NS["Namespace: voting-app-dev"]
+                direction TB
+                VOTE_DEV["🗳️ Vote Service\nPython Flask\n2 replicas"]
+                RESULT_DEV["📊 Result Service\nNode.js Express\n2 replicas"]
+                WORKER_DEV["⚙️ Worker Service\n.NET Core\n1 replica"]
+                REDIS_DEV[("🔴 Redis\nIn-Memory Queue\n1 replica")]
+                PG_DEV[("🐘 PostgreSQL\nPersistent Storage\n1 replica")]
+            end
+
+            subgraph QA_NS["Namespace: voting-app-qa"]
+                direction TB
+                subgraph CANARY_BOX["🐤 Argo Rollouts - Canary"]
+                    VOTE_STABLE["🗳️ Vote (Stable)\n90% traffic"]
+                    VOTE_CANARY["🗳️ Vote (Canary)\n10% traffic"]
+                end
+                RESULT_QA["📊 Result Service\n2 replicas"]
+                WORKER_QA["⚙️ Worker Service\n1 replica"]
+                REDIS_QA[("🔴 Redis\n1 replica")]
+                PG_QA[("🐘 PostgreSQL\n1 replica")]
+            end
+
+            subgraph PLATFORM_NS["Platform Services"]
+                ARGOCD["🔄 ArgoCD\nGitOps Controller"]
+                ROLLOUTS["📈 Argo Rollouts\nProgressive Delivery"]
+                EXTDNS["📍 ExternalDNS\nRoute53 Automation"]
+                CERTMGR["🔐 cert-manager\nTLS Certificates"]
+            end
+        end
+
+        subgraph ECR_BOX["📦 Amazon ECR"]
+            ECR_VOTE["📦 vote:tag"]
+            ECR_RESULT["📦 result:tag"]
+            ECR_WORKER["📦 worker:tag"]
+        end
+    end
+
+    subgraph GITHUB["🐙 GitHub"]
+        REPO["📂 Source Repository"]
+        GHA["⚡ GitHub Actions\nCI/CD Pipeline"]
+    end
+
+    subgraph INTEGRATIONS["🔌 Integrations"]
+        NR["📈 New Relic\nAPM & Metrics"]
+        SLACK["💬 Slack\nNotifications"]
+        JIRA["🎫 Jira\nTicket Tracking"]
+    end
+
+    %% Numbered Flow - User Request Path
+    USER -->|"1️⃣ HTTPS"| R53_DEV & R53_QA
+    R53_DEV & R53_QA -->|"2️⃣ DNS Resolution"| ALB
+    ALB -->|"3️⃣ TLS Termination"| NGINX
+    NGINX -->|"4️⃣ Route /vote"| VOTE_DEV
+    NGINX -->|"4️⃣ Route /vote"| VOTE_STABLE & VOTE_CANARY
+    NGINX -->|"4️⃣ Route /result"| RESULT_DEV & RESULT_QA
+
+    %% Application Data Flow
+    VOTE_DEV -->|"5️⃣ LPUSH"| REDIS_DEV
+    VOTE_STABLE & VOTE_CANARY -->|"5️⃣ LPUSH"| REDIS_QA
+    REDIS_DEV -->|"6️⃣ RPOP"| WORKER_DEV
+    REDIS_QA -->|"6️⃣ RPOP"| WORKER_QA
+    WORKER_DEV -->|"7️⃣ UPSERT"| PG_DEV
+    WORKER_QA -->|"7️⃣ UPSERT"| PG_QA
+    PG_DEV -->|"8️⃣ SELECT"| RESULT_DEV
+    PG_QA -->|"8️⃣ SELECT"| RESULT_QA
+
+    %% CI/CD Flow
+    REPO -->|"9️⃣ git push"| GHA
+    GHA -->|"🔟 docker build/push"| ECR_VOTE & ECR_RESULT & ECR_WORKER
+    GHA -->|"1️⃣1️⃣ sync"| ARGOCD
+    ARGOCD -->|"1️⃣2️⃣ deploy"| DEV_NS & QA_NS
+    ROLLOUTS -->|"1️⃣3️⃣ canary mgmt"| CANARY_BOX
+
+    %% Monitoring
+    DEV_NS & QA_NS -.->|"metrics"| NR
+    GHA -.->|"notify"| SLACK
+    GHA -.->|"track"| JIRA
+    NR -.->|"analysis"| ROLLOUTS
+
+    %% Apply Styles
+    class USER userStyle
+    class AWS,DNS,ECR_BOX awsStyle
+    class EKS,INGRESS_NS,DEV_NS,QA_NS,PLATFORM_NS k8sStyle
+    class VOTE_DEV,RESULT_DEV,WORKER_DEV,VOTE_STABLE,VOTE_CANARY,RESULT_QA,WORKER_QA appStyle
+    class REDIS_DEV,PG_DEV,REDIS_QA,PG_QA dataStyle
+    class GITHUB,REPO,GHA cicdStyle
+    class NR,SLACK,JIRA monitorStyle
+```
+ARCH
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # CI/CD PIPELINE DIAGRAM
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "🔄 Generate CI/CD Pipeline Diagram"
+        if: inputs.diagram_type == 'ci-cd-pipeline' || inputs.diagram_type == 'all' || github.event.inputs.diagram_type == 'ci-cd-pipeline' || github.event.inputs.diagram_type == 'all'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 CI/CD Pipeline Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Enterprise CI/CD pipeline with 6 stages: Bootstrap, Test & Scan, Build, Deploy DEV, Promote QA, and Canary." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'PIPELINE'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4285f4', 'background': '#ffffff', 'lineColor': '#5f6368'}}}%%
+flowchart LR
+    subgraph S0["🏗️ Stage 0: Bootstrap"]
+        B0["00-bootstrap\ninfrastructure"]
+    end
+
+    subgraph S1["🔍 Stage 1: Test & Scan"]
+        direction TB
+        T1["🔍 SAST\n(Semgrep)"]
+        T2["📦 SCA\n(Trivy)"]
+        T3["🔐 Secrets\n(Gitleaks)"]
+        T4["📝 Lint"]
+        T5["🧪 Unit Tests"]
+        T6{"🚦 Quality\nGate"}
+    end
+
+    subgraph S2["🔨 Stage 2: Build"]
+        direction TB
+        B1["🐍 Build Vote\n(Python)"]
+        B2["📊 Build Result\n(Node.js)"]
+        B3["⚙️ Build Worker\n(.NET)"]
+        B4["🔍 Container Scan\n(Anchore/Grype)"]
+        B5["📤 Push to ECR"]
+    end
+
+    subgraph S3["🚀 Stage 3: Deploy DEV"]
+        direction TB
+        D1["🎫 Create Jira Ticket"]
+        D2["🔎 Pre-deploy Check"]
+        D3["📝 Update Manifests"]
+        D4["🔄 ArgoCD Sync"]
+        D5["✅ Verify Health"]
+        D6["🧪 Smoke Tests"]
+        D7["🏗️ Architecture Diagram"]
+    end
+
+    subgraph S4["⬆️ Stage 4: Promote QA"]
+        direction TB
+        Q0{"⏸️ Approval\nGate"}
+        Q1["🎫 Create Jira Ticket"]
+        Q2["📝 Update Manifests"]
+        Q3["🔄 ArgoCD Sync"]
+    end
+
+    subgraph S5["🐤 Stage 5: Canary"]
+        direction TB
+        C1["📊 10% Traffic"]
+        C2["📊 30% Traffic"]
+        C3["📊 60% Traffic"]
+        C4["📊 100% Traffic"]
+        C5{"📈 New Relic\nAnalysis"}
+    end
+
+    subgraph NOTIFY["📢 Notifications"]
+        N1["💬 Slack"]
+        N2["🎫 Jira Update"]
+    end
+
+    %% Connections
+    B0 --> T1 & T2 & T3 & T4 & T5
+    T1 & T2 & T3 & T4 & T5 --> T6
+    T6 -->|"✅ Pass"| B1 & B2 & B3
+    T6 -->|"❌ Fail"| N1
+    B1 & B2 & B3 --> B4
+    B4 --> B5
+    B5 --> D1
+    D1 --> D2 --> D3 --> D4 --> D5 --> D6 --> D7
+    D7 --> Q0
+    Q0 -->|"✅ Approved"| Q1
+    Q0 -->|"❌ Rejected"| N1
+    Q1 --> Q2 --> Q3
+    Q3 --> C1
+    C1 --> C5
+    C5 -->|"✅ Healthy"| C2
+    C5 -->|"❌ Unhealthy"| N1
+    C2 --> C3 --> C4
+    C4 --> N1 & N2
+
+    style S0 fill:#e8f0fe,stroke:#1a73e8
+    style S1 fill:#fce8e6,stroke:#ea4335
+    style S2 fill:#e6f4ea,stroke:#34a853
+    style S3 fill:#e8f0fe,stroke:#1a73e8
+    style S4 fill:#fef7e0,stroke:#fbbc04
+    style S5 fill:#f3e8fd,stroke:#9334e6
+    style NOTIFY fill:#f1f3f4,stroke:#5f6368
+```
+PIPELINE
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # SEQUENCE DIAGRAM
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "📐 Generate Sequence Diagram"
+        if: inputs.diagram_type == 'sequence-diagram' || inputs.diagram_type == 'all' || github.event.inputs.diagram_type == 'sequence-diagram' || github.event.inputs.diagram_type == 'all'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📐 Deployment Sequence Diagram" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Step-by-step sequence showing all interactions during a deployment, from code push to production." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'SEQ'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'background': '#ffffff', 'actorBkg': '#4285f4', 'actorTextColor': '#ffffff', 'actorLineColor': '#5f6368', 'signalColor': '#1a73e8', 'signalTextColor': '#1a1a1a'}}}%%
+sequenceDiagram
+    autonumber
+    
+    participant DEV as 👨‍💻 Developer
+    participant GH as 🐙 GitHub
+    participant GHA as ⚡ GitHub Actions
+    participant SCAN as 🔍 Security Scanners
+    participant JIRA as 🎫 Jira
+    participant ECR as 📦 Amazon ECR
+    participant ARGO as 🔄 ArgoCD
+    participant K8S as ⎈ Kubernetes
+    participant APP as 🗳️ Application
+    participant NR as 📈 New Relic
+    participant SLACK as 💬 Slack
+
+    rect rgb(232, 240, 254)
+        Note over DEV,GH: 1️⃣ Code Commit Phase
+        DEV->>GH: git push (feature branch)
+        GH->>GHA: Trigger CI workflow
+    end
+
+    rect rgb(252, 232, 230)
+        Note over GHA,SCAN: 2️⃣ Security Scan Phase
+        par Parallel Scanning
+            GHA->>SCAN: Run SAST (Semgrep)
+            GHA->>SCAN: Run SCA (Trivy)
+            GHA->>SCAN: Run Secret Scan (Gitleaks)
+        end
+        SCAN-->>GHA: Scan Results
+        GHA->>GHA: Evaluate Quality Gate
+        alt Gate Failed
+            GHA->>SLACK: ❌ Build failed notification
+        end
+    end
+
+    rect rgb(230, 244, 234)
+        Note over GHA,ECR: 3️⃣ Build & Push Phase
+        par Parallel Builds
+            GHA->>GHA: Build vote image
+            GHA->>GHA: Build result image
+            GHA->>GHA: Build worker image
+        end
+        GHA->>SCAN: Container vulnerability scan
+        GHA->>ECR: Push images with tag
+    end
+
+    rect rgb(232, 240, 254)
+        Note over GHA,K8S: 4️⃣ Deploy to DEV Phase
+        GHA->>JIRA: Create deployment ticket
+        JIRA-->>GHA: Ticket: PR1-XXX
+        GHA->>GH: Update Kustomize manifests
+        GHA->>ARGO: Trigger sync
+        ARGO->>GH: Pull latest manifests
+        ARGO->>K8S: Apply Kubernetes resources
+        K8S->>ECR: Pull new images
+        K8S->>APP: Rolling update pods
+        GHA->>JIRA: Update: Deployed to DEV
+        GHA->>SLACK: ✅ DEV deployment complete
+    end
+
+    rect rgb(254, 247, 224)
+        Note over DEV,GHA: 5️⃣ Approval Phase
+        GHA->>SLACK: 🚦 Request QA approval
+        SLACK-->>DEV: Notification
+        DEV->>GHA: ✅ Approve promotion
+        GHA->>JIRA: Create promotion ticket
+    end
+
+    rect rgb(243, 232, 253)
+        Note over GHA,NR: 6️⃣ Canary Deployment Phase
+        GHA->>ARGO: Update QA manifests
+        ARGO->>K8S: Deploy canary (10%)
+        
+        loop Canary Analysis (10% → 30% → 60% → 100%)
+            K8S->>APP: Route traffic to canary
+            APP->>NR: Send metrics (error rate, latency)
+            NR-->>ARGO: Analysis result
+            alt Metrics Healthy
+                ARGO->>K8S: Increase canary weight
+            else Metrics Unhealthy
+                ARGO->>K8S: Rollback to stable
+                ARGO->>SLACK: ⚠️ Canary failed
+                ARGO->>JIRA: Update: Rollback triggered
+            end
+        end
+        
+        ARGO->>K8S: Promote canary to stable
+        ARGO->>JIRA: ✅ QA deployment complete
+        ARGO->>SLACK: ✅ Canary promotion successful
+    end
+
+    rect rgb(241, 243, 244)
+        Note over GHA,SLACK: 7️⃣ Completion Phase
+        GHA->>GHA: Generate architecture diagram
+        GHA->>JIRA: Close deployment ticket
+        GHA->>SLACK: 📊 Deployment summary
+    end
+```
+SEQ
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # DATA FLOW DIAGRAM
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: "🔀 Generate Data Flow Diagram"
+        if: inputs.diagram_type == 'data-flow' || inputs.diagram_type == 'all' || github.event.inputs.diagram_type == 'data-flow' || github.event.inputs.diagram_type == 'all'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔀 Application Data Flow" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Data flow through the voting application, from user vote submission to results display." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'DATA'
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'background': '#ffffff'}}}%%
+flowchart LR
+    subgraph CLIENT["👤 Client"]
+        BROWSER["🌐 Web Browser"]
+    end
+
+    subgraph VOTE_FLOW["🗳️ Voting Flow"]
+        direction TB
+        V1["1️⃣ Visit vote.domain.com"]
+        V2["2️⃣ Display vote options\n(Cats vs Dogs)"]
+        V3["3️⃣ User clicks vote button"]
+        V4["4️⃣ POST /vote\n{voter_id, vote}"]
+    end
+
+    subgraph BACKEND["⚙️ Backend Services"]
+        direction TB
+        
+        subgraph VOTE_SVC["🐍 Vote Service (Flask)"]
+            VS1["Receive HTTP POST"]
+            VS2["Generate voter_id cookie"]
+            VS3["LPUSH to Redis queue"]
+        end
+        
+        subgraph REDIS_Q["🔴 Redis"]
+            RQ[("votes queue\nLIST type")]
+        end
+        
+        subgraph WORKER_SVC["🔧 Worker (.NET)"]
+            WS1["RPOP from queue"]
+            WS2["Parse vote data"]
+            WS3["UPSERT to PostgreSQL"]
+        end
+        
+        subgraph PG_DB["🐘 PostgreSQL"]
+            DB[("votes table\nid | vote")]
+        end
+        
+        subgraph RESULT_SVC["📊 Result Service (Node.js)"]
+            RS1["SELECT COUNT(*)\nGROUP BY vote"]
+            RS2["Calculate percentages"]
+            RS3["WebSocket broadcast"]
+        end
+    end
+
+    subgraph RESULT_FLOW["📊 Results Flow"]
+        direction TB
+        R1["5️⃣ Visit results.domain.com"]
+        R2["6️⃣ WebSocket connection"]
+        R3["7️⃣ Real-time updates"]
+        R4["8️⃣ Display percentages"]
+    end
+
+    %% Connections
+    BROWSER --> V1 --> V2 --> V3 --> V4
+    V4 --> VS1 --> VS2 --> VS3
+    VS3 -->|"LPUSH"| RQ
+    RQ -->|"RPOP"| WS1
+    WS1 --> WS2 --> WS3
+    WS3 -->|"UPSERT"| DB
+    DB -->|"SELECT"| RS1
+    RS1 --> RS2 --> RS3
+    
+    BROWSER --> R1 --> R2
+    RS3 -->|"WebSocket"| R3 --> R4 --> BROWSER
+
+    style VOTE_SVC fill:#4285f4,stroke:#1a73e8,color:#fff
+    style WORKER_SVC fill:#9334e6,stroke:#7627bb,color:#fff
+    style RESULT_SVC fill:#34a853,stroke:#1e8e3e,color:#fff
+    style REDIS_Q fill:#ea4335,stroke:#c5221f,color:#fff
+    style PG_DB fill:#fbbc04,stroke:#f9ab00,color:#1a1a1a
+```
+DATA
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Data Stores" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Store | Type | Purpose | Data Format |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|---------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Redis | In-Memory | Vote Queue | \`{voter_id: string, vote: 'a'\|'b'}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PostgreSQL | Persistent | Vote Storage | \`votes(id VARCHAR, vote VARCHAR)\` |" >> $GITHUB_STEP_SUMMARY
 
       # ════════════════════════════════════════════════════════════════════════════
       # KUBERNETES TOPOLOGY
       # ════════════════════════════════════════════════════════════════════════════
       - name: "☸️ Generate Kubernetes Topology"
-        if: inputs.diagram_type == 'kubernetes-topology' || inputs.diagram_type == 'all'
+        if: inputs.diagram_type == 'kubernetes-topology' || inputs.diagram_type == 'all' || github.event.inputs.diagram_type == 'kubernetes-topology' || github.event.inputs.diagram_type == 'all'
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## ☸️ Kubernetes Resource Topology" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          ENVS="${{ inputs.environment }}"
+          ENVS="${{ inputs.environment || github.event.inputs.environment || 'all' }}"
           [ "$ENVS" = "all" ] && ENVS="dev qa"
           
           for ENV in $ENVS; do
@@ -197,352 +572,71 @@ jobs:
             echo "### ${ENV^^} Environment (\`${NAMESPACE}\`)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
-            if [ "${{ inputs.output_format }}" = "mermaid" ]; then
-              cat >> $GITHUB_STEP_SUMMARY << MERMAID
-          \`\`\`mermaid
-          graph LR
-              subgraph "${NAMESPACE}"
-                  subgraph "Deployments/Rollouts"
-          MERMAID
-              
-              # Get deployments and rollouts
-              DEPS=$(kubectl get deployments,rollouts -n $NAMESPACE -o name 2>/dev/null | sed 's/.*\///')
-              for DEP in $DEPS; do
-                REPLICAS=$(kubectl get deployment,rollout $DEP -n $NAMESPACE -o jsonpath='{.status.replicas}' 2>/dev/null || echo "?")
-                echo "            ${DEP}[\"${DEP}<br/>Replicas: ${REPLICAS}\"]" >> $GITHUB_STEP_SUMMARY
-              done
-              
-              cat >> $GITHUB_STEP_SUMMARY << MERMAID
-                  end
-                  subgraph "Services"
-          MERMAID
-              
-              # Get services
-              SVCS=$(kubectl get svc -n $NAMESPACE -o name 2>/dev/null | sed 's/.*\///')
-              for SVC in $SVCS; do
-                TYPE=$(kubectl get svc $SVC -n $NAMESPACE -o jsonpath='{.spec.type}' 2>/dev/null || echo "ClusterIP")
-                PORT=$(kubectl get svc $SVC -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "?")
-                echo "            svc_${SVC}[\"${SVC}<br/>${TYPE}:${PORT}\"]" >> $GITHUB_STEP_SUMMARY
-              done
-              
-              cat >> $GITHUB_STEP_SUMMARY << MERMAID
-                  end
-                  subgraph "Storage"
-          MERMAID
-              
-              # Get StatefulSets
-              STS=$(kubectl get statefulsets -n $NAMESPACE -o name 2>/dev/null | sed 's/.*\///')
-              for ST in $STS; do
-                REPLICAS=$(kubectl get statefulset $ST -n $NAMESPACE -o jsonpath='{.status.replicas}' 2>/dev/null || echo "?")
-                echo "            sts_${ST}[(\"${ST}<br/>Replicas: ${REPLICAS}\")]" >> $GITHUB_STEP_SUMMARY
-              done
-              
-              cat >> $GITHUB_STEP_SUMMARY << 'MERMAID'
-                  end
-              end
-          ```
-          MERMAID
-            fi
-            
-            # ASCII table view
-            if [ "${{ inputs.output_format }}" = "ascii" ] || [ "${{ inputs.output_format }}" = "summary" ]; then
+            # Try to get live data from cluster
+            if kubectl get namespace $NAMESPACE &>/dev/null; then
               echo "| Resource Type | Name | Status | Replicas |" >> $GITHUB_STEP_SUMMARY
               echo "|---------------|------|--------|----------|" >> $GITHUB_STEP_SUMMARY
               
               # Deployments
               kubectl get deployments -n $NAMESPACE -o json 2>/dev/null | \
-                jq -r '.items[] | "| Deployment | \(.metadata.name) | \(.status.conditions[-1].type) | \(.status.readyReplicas // 0)/\(.status.replicas // 0) |"' >> $GITHUB_STEP_SUMMARY || true
+                jq -r '.items[] | "| Deployment | \(.metadata.name) | \(.status.conditions[-1].type) | \(.status.readyReplicas // 0)/\(.status.replicas // 0) |"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
               
               # Rollouts
               kubectl get rollouts -n $NAMESPACE -o json 2>/dev/null | \
-                jq -r '.items[] | "| Rollout | \(.metadata.name) | \(.status.phase // "Unknown") | \(.status.readyReplicas // 0)/\(.spec.replicas // 0) |"' >> $GITHUB_STEP_SUMMARY || true
+                jq -r '.items[] | "| Rollout | \(.metadata.name) | \(.status.phase // "Unknown") | \(.status.readyReplicas // 0)/\(.spec.replicas // 0) |"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
               
               # StatefulSets
               kubectl get statefulsets -n $NAMESPACE -o json 2>/dev/null | \
-                jq -r '.items[] | "| StatefulSet | \(.metadata.name) | Ready | \(.status.readyReplicas // 0)/\(.status.replicas // 0) |"' >> $GITHUB_STEP_SUMMARY || true
+                jq -r '.items[] | "| StatefulSet | \(.metadata.name) | Ready | \(.status.readyReplicas // 0)/\(.status.replicas // 0) |"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
               
+              # Services
               echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Services:**" >> $GITHUB_STEP_SUMMARY
+              echo "| Service | Type | Port | Selector |" >> $GITHUB_STEP_SUMMARY
+              echo "|---------|------|------|----------|" >> $GITHUB_STEP_SUMMARY
+              kubectl get svc -n $NAMESPACE -o json 2>/dev/null | \
+                jq -r '.items[] | "| \(.metadata.name) | \(.spec.type) | \(.spec.ports[0].port) | \(.spec.selector | to_entries | map("\(.key)=\(.value)") | join(", ")) |"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+            else
+              echo "> ⚠️ Unable to connect to cluster or namespace not found" >> $GITHUB_STEP_SUMMARY
             fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
           done
-
-      # ════════════════════════════════════════════════════════════════════════════
-      # CI/CD PIPELINE DIAGRAM
-      # ════════════════════════════════════════════════════════════════════════════
-      - name: "🔄 Generate CI/CD Pipeline Diagram"
-        if: inputs.diagram_type == 'ci-cd-pipeline' || inputs.diagram_type == 'all'
-        run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 🔄 CI/CD Pipeline Architecture" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ inputs.output_format }}" = "mermaid" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'MERMAID'
-          ```mermaid
-          flowchart LR
-              subgraph "Stage 0: Bootstrap"
-                  B0[("🏗️ 00-bootstrap<br/>infrastructure")]
-              end
-              
-              subgraph "Stage 1: CI - Test & Scan"
-                  direction TB
-                  T1["🔍 SAST<br/>(Semgrep)"]
-                  T2["📦 SCA<br/>(Trivy)"]
-                  T3["🔐 Secrets<br/>(Gitleaks)"]
-                  T4["📝 Lint"]
-                  T5["🧪 Unit Tests"]
-                  T6{"🚦 Quality<br/>Gate"}
-              end
-              
-              subgraph "Stage 2: CI - Build"
-                  direction TB
-                  B1["🔨 Build Vote"]
-                  B2["🔨 Build Result"]
-                  B3["🔨 Build Worker"]
-                  B4["🔍 Container Scan<br/>(Anchore)"]
-                  B5["📤 Push to ECR"]
-              end
-              
-              subgraph "Stage 3: CD - DEV"
-                  D1["📋 Pre-deploy Check"]
-                  D2["📝 Update Manifests"]
-                  D3["🔄 ArgoCD Sync"]
-                  D4["✅ Verify Deployment"]
-                  D5["🧪 Smoke Tests"]
-              end
-              
-              subgraph "Stage 4: CD - QA"
-                  Q0{"⏸️ Manual<br/>Approval"}
-                  Q1["📋 Pre-deploy Check"]
-                  Q2["📝 Update Manifests"]
-                  Q3["🔄 ArgoCD Sync"]
-              end
-              
-              subgraph "Stage 5: Canary"
-                  C1["📊 10% Traffic"]
-                  C2["📊 30% Traffic"]
-                  C3["📊 60% Traffic"]
-                  C4["📊 100% Traffic"]
-                  C5{"📈 New Relic<br/>Analysis"}
-              end
-              
-              subgraph "Notifications"
-                  N1["💬 Slack"]
-                  N2["🎫 Jira"]
-              end
-              
-              B0 --> T1 & T2 & T3 & T4 & T5
-              T1 & T2 & T3 & T4 & T5 --> T6
-              T6 -->|Pass| B1 & B2 & B3
-              T6 -->|Fail| N1
-              B1 & B2 & B3 --> B4
-              B4 --> B5
-              B5 --> D1
-              D1 --> D2 --> D3 --> D4 --> D5
-              D5 --> Q0
-              Q0 -->|Approved| Q1
-              Q0 -->|Rejected| N1
-              Q1 --> Q2 --> Q3
-              Q3 --> C1
-              C1 --> C5
-              C5 -->|Healthy| C2
-              C5 -->|Unhealthy| N1
-              C2 --> C3 --> C4
-              C4 --> N1 & N2
-          ```
-          MERMAID
-          fi
-          
-          if [ "${{ inputs.output_format }}" = "ascii" ] || [ "${{ inputs.output_format }}" = "summary" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'ASCII'
-          
-          ```
-          ┌─────────────────────────────────────────────────────────────────────────────────────┐
-          │                           CI/CD PIPELINE FLOW                                       │
-          └─────────────────────────────────────────────────────────────────────────────────────┘
-          
-          STAGE 0: BOOTSTRAP (One-time)
-          ┌──────────────────────────┐
-          │ 🏗️  00-bootstrap          │──→ ECR, K8s Namespaces, ArgoCD Apps, GitHub Envs
-          └──────────────────────────┘
-          
-          STAGE 1: CI - TEST & SCAN (Parallel)
-          ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
-          │ 🔍 SAST    │ │ 📦 SCA     │ │ 🔐 Secrets │ │ 📝 Lint    │ │ 🧪 Tests   │
-          │ (Semgrep)  │ │ (Trivy)    │ │ (Gitleaks) │ │            │ │            │
-          └─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-                │              │              │              │              │
-                └──────────────┴──────────────┼──────────────┴──────────────┘
-                                              ▼
-                                     ┌──────────────┐
-                                     │ 🚦 Quality   │
-                                     │    Gate      │
-                                     └──────┬───────┘
-                                            │
-          STAGE 2: CI - BUILD (Parallel)    │
-                                            ▼
-          ┌────────────┐ ┌────────────┐ ┌────────────┐
-          │ 🔨 Build   │ │ 🔨 Build   │ │ 🔨 Build   │
-          │   Vote     │ │   Result   │ │   Worker   │
-          └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-                │              │              │
-                └──────────────┼──────────────┘
-                               ▼
-                      ┌──────────────┐
-                      │ 🔍 Container │
-                      │    Scan      │──→ Push to ECR
-                      └──────┬───────┘
-                             │
-          STAGE 3: CD - DEV  │
-                             ▼
-          ┌──────────────────────────────────────────────────────────────────┐
-          │  Pre-check → Update Manifests → ArgoCD Sync → Verify → Smoke    │
-          └──────────────────────────────────────────────────────────────────┘
-                                              │
-          STAGE 4: CD - QA                    ▼
-                                     ┌──────────────┐
-                                     │ ⏸️  Manual    │
-                                     │   Approval   │
-                                     └──────┬───────┘
-                                            │
-          ┌──────────────────────────────────────────────────────────────────┐
-          │  Pre-check → Update Manifests → ArgoCD Sync                      │
-          └──────────────────────────────────────────────────────────────────┘
-                                              │
-          STAGE 5: CANARY                     ▼
-          ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐
-          │  10%   │───▶│  30%   │───▶│  60%   │───▶│ 100%   │
-          │Traffic │    │Traffic │    │Traffic │    │Traffic │
-          └───┬────┘    └───┬────┘    └───┬────┘    └───┬────┘
-              │             │             │             │
-              └─────────────┴─────────────┴─────────────┘
-                                    │
-                          ┌─────────▼─────────┐
-                          │ 📊 New Relic      │
-                          │    Analysis       │
-                          └───────────────────┘
-          ```
-          ASCII
-          fi
-
-      # ════════════════════════════════════════════════════════════════════════════
-      # DATA FLOW DIAGRAM
-      # ════════════════════════════════════════════════════════════════════════════
-      - name: "🔀 Generate Data Flow Diagram"
-        if: inputs.diagram_type == 'data-flow' || inputs.diagram_type == 'all'
-        run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 🔀 Application Data Flow" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ inputs.output_format }}" = "mermaid" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'MERMAID'
-          ```mermaid
-          sequenceDiagram
-              participant U as 👤 User
-              participant V as 🗳️ Vote Service
-              participant R as 🔴 Redis
-              participant W as ⚙️ Worker
-              participant DB as 🐘 PostgreSQL
-              participant RS as 📊 Result Service
-              participant NR as 📈 New Relic
-              
-              Note over U,NR: Voting Flow
-              
-              U->>V: Cast vote (Cats/Dogs)
-              activate V
-              V->>NR: Record transaction
-              V->>R: LPUSH vote:{voter_id, vote}
-              V-->>U: Vote confirmed
-              deactivate V
-              
-              Note over R,DB: Background Processing
-              
-              loop Continuous
-                  W->>R: RPOP vote
-                  activate W
-                  W->>DB: UPSERT votes SET vote = ?
-                  W->>NR: Record transaction
-                  deactivate W
-              end
-              
-              Note over U,RS: Results Display
-              
-              U->>RS: View results
-              activate RS
-              RS->>DB: SELECT vote, COUNT(*) GROUP BY vote
-              RS->>NR: Record transaction
-              RS-->>U: Results (WebSocket updates)
-              deactivate RS
-              
-              Note over V,NR: Canary Analysis
-              
-              NR-->>NR: Aggregate metrics:<br/>Error Rate, Latency, Apdex
-              NR-->>W: Canary health check
-          ```
-          MERMAID
-          fi
-          
-          if [ "${{ inputs.output_format }}" = "ascii" ] || [ "${{ inputs.output_format }}" = "summary" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'ASCII'
-          
-          ### Voting Flow
-          
-          ```
-          ┌────────┐     ┌────────────────┐     ┌───────────┐
-          │  User  │────▶│  Vote Service  │────▶│   Redis   │
-          │        │     │  (Flask/Py)    │     │  (Queue)  │
-          └────────┘     └────────────────┘     └─────┬─────┘
-                                                      │
-                                                      ▼
-                                               ┌───────────┐
-                                               │  Worker   │
-                                               │  (.NET)   │
-                                               └─────┬─────┘
-                                                     │
-                                                     ▼
-                                              ┌────────────┐
-                                              │ PostgreSQL │
-                                              │ (Database) │
-                                              └──────┬─────┘
-                                                     │
-                         ┌────────┐     ┌────────────┴───────┐
-                         │  User  │◀────│  Result Service    │
-                         │        │     │  (Node.js/Socket)  │
-                         └────────┘     └────────────────────┘
-          ```
-          
-          ### Data Stores
-          
-          | Store | Purpose | Data |
-          |-------|---------|------|
-          | Redis | Vote Queue | `{voter_id, vote}` |
-          | PostgreSQL | Vote Storage | `votes(id, vote)` |
-          
-          ASCII
-          fi
 
       # ════════════════════════════════════════════════════════════════════════════
       # SUMMARY
       # ════════════════════════════════════════════════════════════════════════════
-      - name: "📋 Diagram Summary"
+      - name: "📋 Generate Summary"
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📋 Diagram Generation Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Quick Reference" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Diagram Type | ${{ inputs.diagram_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Output Format | ${{ inputs.output_format }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Generated | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Environment URLs" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tip:** Mermaid diagrams render automatically in GitHub Markdown and can be exported as images." >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Vote App | Results App |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|----------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| DEV | [${{ env.DEV_URL }}](${{ env.DEV_URL }}) | [results.dev](https://results.opsera-voting-app-dev.agent.opsera.dev) |" >> $GITHUB_STEP_SUMMARY
+          echo "| QA | [${{ env.QA_URL }}](${{ env.QA_URL }}) | [results.qa](https://results.opsera-voting-app-qa.agent.opsera.dev) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "### 🛠️ Technology Stack" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | Vote URL | Result URL |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------------|----------|------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| DEV | [vote-dev](https://opsera-voting-app-dev.agent.opsera.dev) | [result-dev](https://results.opsera-voting-app-dev.agent.opsera.dev) |" >> $GITHUB_STEP_SUMMARY
-          echo "| QA | [vote-qa](https://opsera-voting-app-qa.agent.opsera.dev) | [result-qa](https://results.opsera-voting-app-qa.agent.opsera.dev) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Technology | Purpose |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Vote Service | Python Flask | Web UI for voting |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result Service | Node.js Express | Real-time results display |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker | .NET Core | Vote processing |" >> $GITHUB_STEP_SUMMARY
+          echo "| Queue | Redis | Message broker |" >> $GITHUB_STEP_SUMMARY
+          echo "| Database | PostgreSQL | Persistent storage |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ingress | NGINX | Traffic routing |" >> $GITHUB_STEP_SUMMARY
+          echo "| TLS | cert-manager | SSL certificates |" >> $GITHUB_STEP_SUMMARY
+          echo "| GitOps | ArgoCD | Deployment automation |" >> $GITHUB_STEP_SUMMARY
+          echo "| Progressive Delivery | Argo Rollouts | Canary deployments |" >> $GITHUB_STEP_SUMMARY
+          echo "| Monitoring | New Relic | APM & metrics |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 💡 **Tip:** Mermaid diagrams render automatically in GitHub. Click on the workflow summary to view the diagrams." >> $GITHUB_STEP_SUMMARY

@@ -36,7 +36,7 @@ on:
         default: 'all'
 
 env:
-  NEWRELIC_URL: https://opsera-nrmock-labs.agent.opsera.dev
+  NEWRELIC_SERVER_URL: https://opsera-nrmock-labs.agent.opsera.dev
   NEWRELIC_API_KEY: NRAK-4IMK8U4SSYUWIZWETQV6WT7TXF9FL6L3
   APP_NAME: voting-app
 
@@ -62,7 +62,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Test API connectivity
-          RESPONSE=$(curl -s -w "\n%{http_code}" "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+          RESPONSE=$(curl -s -w "\n%{http_code}" "${{ env.NEWRELIC_SERVER_URL }}/v2/applications.json" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
             -H "Content-Type: application/json")
           
@@ -83,7 +83,7 @@ jobs:
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Mock Server:** \`${{ env.NEWRELIC_URL }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Mock Server:** \`${{ env.NEWRELIC_SERVER_URL }}\`" >> $GITHUB_STEP_SUMMARY
 
   # ════════════════════════════════════════════════════════════════════════════════
   # STAGE 2: PROVISION APPLICATIONS (Idempotent)
@@ -112,7 +112,7 @@ jobs:
               APP_NAME="${SERVICE}-${ENV}"
               
               # Check if app exists
-              EXISTING=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+              EXISTING=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications.json" \
                 -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" | \
                 jq -r ".applications[] | select(.name == \"${APP_NAME}\") | .id" 2>/dev/null || echo "")
               
@@ -120,7 +120,7 @@ jobs:
                 echo "| \`${SERVICE}\` | ${ENV} | ✅ Exists (ID: ${EXISTING}) |" >> $GITHUB_STEP_SUMMARY
               else
                 # Register new application
-                RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+                RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/v2/applications.json" \
                   -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
                   -H "Content-Type: application/json" \
                   -d "{
@@ -162,7 +162,7 @@ jobs:
           
           for ENV in $ENVS; do
             # Request new ingest key
-            RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/v2/api_keys" \
+            RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/v2/api_keys" \
               -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d "{
@@ -205,7 +205,7 @@ jobs:
             POLICY_NAME="voting-app-${ENV}-alerts"
             
             # Check if policy exists
-            EXISTING=$(curl -s "${{ env.NEWRELIC_URL }}/v2/alerts_policies.json" \
+            EXISTING=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/alerts_policies.json" \
               -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" | \
               jq -r ".policies[] | select(.name == \"${POLICY_NAME}\") | .id" 2>/dev/null || echo "")
             
@@ -214,7 +214,7 @@ jobs:
               echo "| \`${POLICY_NAME}\` | - | - | ✅ Exists |" >> $GITHUB_STEP_SUMMARY
             else
               # Create policy
-              RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/v2/alerts_policies.json" \
+              RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/v2/alerts_policies.json" \
                 -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
                 -H "Content-Type: application/json" \
                 -d "{
@@ -230,7 +230,7 @@ jobs:
             
             # Add conditions (idempotent via GraphQL mutation)
             # Error Rate Condition
-            curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
               -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d "{
@@ -240,7 +240,7 @@ jobs:
             echo "| \`${POLICY_NAME}\` | Error Rate | > 5% | ✅ |" >> $GITHUB_STEP_SUMMARY
             
             # Response Time Condition
-            curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
               -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d "{
@@ -250,7 +250,7 @@ jobs:
             echo "| \`${POLICY_NAME}\` | Response Time | > 500ms | ✅ |" >> $GITHUB_STEP_SUMMARY
             
             # Apdex Condition
-            curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
               -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d "{
@@ -288,7 +288,7 @@ jobs:
             DASHBOARD_NAME="Voting App - ${ENV^^}"
             
             # Create dashboard via GraphQL
-            RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+            RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
               -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d "{
@@ -300,7 +300,7 @@ jobs:
           done
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Dashboard URL:** [\`${{ env.NEWRELIC_URL }}\`](${{ env.NEWRELIC_URL }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Dashboard URL:** [\`${{ env.NEWRELIC_SERVER_URL }}\`](${{ env.NEWRELIC_SERVER_URL }})" >> $GITHUB_STEP_SUMMARY
 
   # ════════════════════════════════════════════════════════════════════════════════
   # STAGE 5: VERIFICATION & SUMMARY
@@ -331,7 +331,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🚀 Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "1. Deploy voting app with New Relic agent enabled" >> $GITHUB_STEP_SUMMARY
-          echo "2. Verify metrics in [New Relic Dashboard](${{ env.NEWRELIC_URL }})" >> $GITHUB_STEP_SUMMARY
+          echo "2. Verify metrics in [New Relic Dashboard](${{ env.NEWRELIC_SERVER_URL }})" >> $GITHUB_STEP_SUMMARY
           echo "3. Test canary analysis with real metrics" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY

@@ -28,7 +28,7 @@ on:
         default: 'all'
 
 env:
-  NEWRELIC_URL: https://opsera-nrmock-labs.agent.opsera.dev
+  NEWRELIC_SERVER_URL: https://opsera-nrmock-labs.agent.opsera.dev
   NEWRELIC_API_KEY: NRAK-4IMK8U4SSYUWIZWETQV6WT7TXF9FL6L3
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
         run: |
           echo "## 🔬 New Relic Integration Test" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Mock Server:** ${{ env.NEWRELIC_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Mock Server:** ${{ env.NEWRELIC_SERVER_URL }}" >> $GITHUB_STEP_SUMMARY
           echo "**Test Type:** ${{ inputs.test_type }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -55,7 +55,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Test with valid key
-          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/v2/api_keys/validate" \
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/v2/api_keys/validate" \
             -H "Content-Type: application/json" \
             -d '{"api_key": "${{ env.NEWRELIC_API_KEY }}"}' || echo '{"error": "Connection failed"}')
           
@@ -77,7 +77,7 @@ jobs:
           echo "### 📱 Applications API" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          RESPONSE=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+          RESPONSE=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications.json" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
             -H "Content-Type: application/json" || echo '{"error": "Connection failed"}')
           
@@ -107,7 +107,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Get first application ID
-          APP_RESPONSE=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications.json" \
+          APP_RESPONSE=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications.json" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
           
           APP_ID=$(echo "$APP_RESPONSE" | jq -r '.applications[0].id' 2>/dev/null || echo "1")
@@ -121,31 +121,31 @@ jobs:
           echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
           
           # HttpDispatcher (Response Time)
-          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=HttpDispatcher" \
+          METRIC=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=HttpDispatcher" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
           AVG_RESPONSE=$(echo "$METRIC" | jq -r '.metrics[0].values.average_response_time // "N/A"' 2>/dev/null || echo "N/A")
           echo "| Response Time | ${AVG_RESPONSE}ms | ✅ |" >> $GITHUB_STEP_SUMMARY
           
           # Errors/all (Error Rate)
-          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Errors/all" \
+          METRIC=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Errors/all" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
           ERROR_RATE=$(echo "$METRIC" | jq -r '.metrics[0].values.errors_per_minute // "N/A"' 2>/dev/null || echo "N/A")
           echo "| Error Rate | ${ERROR_RATE}/min | ✅ |" >> $GITHUB_STEP_SUMMARY
           
           # Apdex
-          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Apdex" \
+          METRIC=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Apdex" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
           APDEX=$(echo "$METRIC" | jq -r '.metrics[0].values.score // "N/A"' 2>/dev/null || echo "N/A")
           echo "| Apdex Score | ${APDEX} | ✅ |" >> $GITHUB_STEP_SUMMARY
           
           # CPU
-          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=CPU" \
+          METRIC=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=CPU" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
           CPU=$(echo "$METRIC" | jq -r '.metrics[0].values.percent // "N/A"' 2>/dev/null || echo "N/A")
           echo "| CPU Usage | ${CPU}% | ✅ |" >> $GITHUB_STEP_SUMMARY
           
           # Memory
-          METRIC=$(curl -s "${{ env.NEWRELIC_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Memory/Heap/Used" \
+          METRIC=$(curl -s "${{ env.NEWRELIC_SERVER_URL }}/v2/applications/${APP_ID}/metrics.json?names[]=Memory/Heap/Used" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}")
           MEMORY=$(echo "$METRIC" | jq -r '.metrics[0].values.used_mb_by_host // "N/A"' 2>/dev/null || echo "N/A")
           echo "| Memory | ${MEMORY}MB | ✅ |" >> $GITHUB_STEP_SUMMARY
@@ -166,7 +166,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Query 1: Transaction Count
-          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
@@ -179,7 +179,7 @@ jobs:
           echo "| \`SELECT count(*) FROM Transaction\` | ${COUNT} |" >> $GITHUB_STEP_SUMMARY
           
           # Query 2: Average Duration
-          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
@@ -190,7 +190,7 @@ jobs:
           echo "| \`SELECT average(duration) FROM Transaction\` | ${AVG} |" >> $GITHUB_STEP_SUMMARY
           
           # Query 3: Percentile
-          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_URL }}/graphql" \
+          RESPONSE=$(curl -s -X POST "${{ env.NEWRELIC_SERVER_URL }}/graphql" \
             -H "Api-Key: ${{ env.NEWRELIC_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
