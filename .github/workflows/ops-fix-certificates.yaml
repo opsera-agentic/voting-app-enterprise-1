@@ -1,0 +1,273 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CERTIFICATE FIXER - Debug and Fix TLS Certificate Issues                     ║
+# ║                                                                                ║
+# ║  Diagnoses and fixes cert-manager certificate issues:                          ║
+# ║  • Check certificate status                                                    ║
+# ║  • View certificate requests and challenges                                    ║
+# ║  • Force certificate renewal                                                   ║
+# ║  • Install/upgrade cert-manager                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🔐 Ops: Fix Certificates"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - diagnose
+          - force-renew
+          - install-certmanager
+          - create-issuer
+        default: 'diagnose'
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - all
+        default: 'all'
+
+env:
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  fix-certificates:
+    name: "🔐 Certificate Operations"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # DIAGNOSE CERTIFICATES
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: Diagnose Certificate Issues
+        if: github.event.inputs.action == 'diagnose'
+        run: |
+          echo "## 🔐 Certificate Diagnosis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check cert-manager installation
+          echo "### cert-manager Status" >> $GITHUB_STEP_SUMMARY
+          if kubectl get namespace cert-manager &>/dev/null; then
+            CM_VERSION=$(kubectl get deployment cert-manager -n cert-manager -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d: -f2)
+            echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| cert-manager | ✅ Installed (${CM_VERSION:-unknown}) |" >> $GITHUB_STEP_SUMMARY
+            
+            # Check pods
+            CM_READY=$(kubectl get pods -n cert-manager -o jsonpath='{.items[*].status.phase}' | tr ' ' '\n' | grep -c Running || echo 0)
+            CM_TOTAL=$(kubectl get pods -n cert-manager --no-headers 2>/dev/null | wc -l)
+            echo "| Pods Ready | ${CM_READY}/${CM_TOTAL} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **cert-manager is NOT installed!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Run with \`action: install-certmanager\` to install it." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check ClusterIssuers
+          echo "### ClusterIssuers" >> $GITHUB_STEP_SUMMARY
+          echo "| Name | Ready | Message |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          kubectl get clusterissuers -o json 2>/dev/null | jq -r '.items[] | "| \(.metadata.name) | \(.status.conditions[0].status // "Unknown") | \(.status.conditions[0].message // "N/A" | .[0:50]) |"' >> $GITHUB_STEP_SUMMARY || echo "| - | No ClusterIssuers found | - |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check Certificates per namespace
+          echo "### Certificates" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | Name | Ready | Expiry | Issuer |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|-------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          ENVS="${{ github.event.inputs.environment }}"
+          [ "$ENVS" = "all" ] && ENVS="dev qa"
+          
+          for ENV in $ENVS; do
+            NS="voting-app-${ENV}"
+            kubectl get certificates -n $NS -o json 2>/dev/null | jq -r ".items[] | \"| ${NS} | \(.metadata.name) | \(.status.conditions[0].status // \"Unknown\") | \(.status.notAfter // \"N/A\") | \(.spec.issuerRef.name) |\"" >> $GITHUB_STEP_SUMMARY || echo "| ${NS} | - | No certificates | - | - |" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check Certificate Requests
+          echo "### Certificate Requests (Pending)" >> $GITHUB_STEP_SUMMARY
+          PENDING_CR=$(kubectl get certificaterequests -A -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions[0].status != "True") | "\(.metadata.namespace)/\(.metadata.name): \(.status.conditions[0].message // "Pending")"' | head -5)
+          
+          if [ -n "$PENDING_CR" ]; then
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "$PENDING_CR" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No pending certificate requests" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check Challenges (ACME)
+          echo "### ACME Challenges" >> $GITHUB_STEP_SUMMARY
+          CHALLENGES=$(kubectl get challenges -A -o json 2>/dev/null | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name): \(.status.state // "pending") - \(.status.reason // "N/A")"' | head -5)
+          
+          if [ -n "$CHALLENGES" ]; then
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "$CHALLENGES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No active challenges" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check TLS Secrets
+          echo "### TLS Secrets" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | Secret | Type | Age |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|------|-----|" >> $GITHUB_STEP_SUMMARY
+          
+          for ENV in $ENVS; do
+            NS="voting-app-${ENV}"
+            kubectl get secrets -n $NS -o json 2>/dev/null | jq -r ".items[] | select(.type == \"kubernetes.io/tls\") | \"| ${NS} | \(.metadata.name) | \(.type) | \(.metadata.creationTimestamp) |\"" >> $GITHUB_STEP_SUMMARY || true
+          done
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # INSTALL CERT-MANAGER
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: Install cert-manager
+        if: github.event.inputs.action == 'install-certmanager'
+        run: |
+          echo "## 🔐 Installing cert-manager" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Install cert-manager
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.yaml
+          
+          echo "Waiting for cert-manager pods to be ready..."
+          kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=180s || true
+          kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=180s || true
+          kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=180s || true
+          
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| cert-manager | ✅ Installed |" >> $GITHUB_STEP_SUMMARY
+          
+          kubectl get pods -n cert-manager >> $GITHUB_STEP_SUMMARY
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # CREATE CLUSTER ISSUER
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: Create ClusterIssuer
+        if: github.event.inputs.action == 'create-issuer'
+        run: |
+          echo "## 🔐 Creating ClusterIssuers" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create Let's Encrypt Production Issuer
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: devops@opsera.io
+              privateKeySecretRef:
+                name: letsencrypt-prod-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+          EOF
+          
+          echo "| Issuer | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| letsencrypt-prod | ✅ Created |" >> $GITHUB_STEP_SUMMARY
+          
+          # Create Let's Encrypt Staging Issuer (for testing)
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: devops@opsera.io
+              privateKeySecretRef:
+                name: letsencrypt-staging-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+          EOF
+          
+          echo "| letsencrypt-staging | ✅ Created |" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait for issuers to be ready
+          sleep 10
+          kubectl get clusterissuers
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # FORCE CERTIFICATE RENEWAL
+      # ════════════════════════════════════════════════════════════════════════════
+      - name: Force Certificate Renewal
+        if: github.event.inputs.action == 'force-renew'
+        run: |
+          echo "## 🔐 Forcing Certificate Renewal" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          ENVS="${{ github.event.inputs.environment }}"
+          [ "$ENVS" = "all" ] && ENVS="dev qa"
+          
+          echo "| Namespace | Certificate | Action |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          for ENV in $ENVS; do
+            NS="voting-app-${ENV}"
+            
+            # Delete existing TLS secrets to force renewal
+            TLS_SECRET=$(kubectl get secrets -n $NS -o name 2>/dev/null | grep tls | head -1)
+            
+            if [ -n "$TLS_SECRET" ]; then
+              kubectl delete $TLS_SECRET -n $NS 2>/dev/null || true
+              echo "| ${NS} | ${TLS_SECRET} | 🔄 Deleted (will regenerate) |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            # Also delete certificate requests to force new ones
+            kubectl delete certificaterequests --all -n $NS 2>/dev/null || true
+            
+            # Trigger ingress re-sync by adding annotation
+            kubectl annotate ingress --all -n $NS cert-manager.io/issue-temporary-certificate="true" --overwrite 2>/dev/null || true
+            kubectl annotate ingress --all -n $NS cert-manager.io/issue-temporary-certificate- --overwrite 2>/dev/null || true
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⏳ **Note:** Certificate issuance may take 1-5 minutes." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run \`action: diagnose\` after a few minutes to verify certificates are ready." >> $GITHUB_STEP_SUMMARY
