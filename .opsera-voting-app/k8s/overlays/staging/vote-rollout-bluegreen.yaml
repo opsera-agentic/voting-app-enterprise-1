@@ -95,10 +95,8 @@ spec:
       activeService: vote
       # Preview service receives traffic during promotion testing
       previewService: vote-preview
-      # Automatic promotion after preview passes (set to false for manual promotion)
-      autoPromotionEnabled: true
-      # Time to wait before promoting (gives time to verify preview)
-      autoPromotionSeconds: 60
+      # Manual promotion - set to false for manual testing
+      autoPromotionEnabled: false
       # Scale down ReplicaSet after switch (reduces resource usage)
       scaleDownDelaySeconds: 30
       # Revision history limit
