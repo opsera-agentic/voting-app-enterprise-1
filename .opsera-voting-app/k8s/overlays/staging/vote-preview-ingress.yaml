@@ -1,0 +1,30 @@
+# Preview ingress for blue-green testing
+# Access new version before promoting to production
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voting-app-preview
+  labels:
+    environment: staging
+    service-type: preview
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - preview.opsera-voting-app-staging.agent.opsera.dev
+    secretName: voting-app-preview-staging-tls
+  rules:
+  - host: preview.opsera-voting-app-staging.agent.opsera.dev
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vote-preview
+            port:
+              number: 80

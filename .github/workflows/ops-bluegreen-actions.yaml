@@ -94,13 +94,19 @@ jobs:
           done
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+          # Show URLs
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 URLs" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Production** | https://opsera-voting-app-${{ github.event.inputs.environment }}.agent.opsera.dev |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Preview (New Version)** | https://preview.opsera-voting-app-${{ github.event.inputs.environment }}.agent.opsera.dev |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           if [ "$PHASE" = "Paused" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
             echo "⏸️ **Rollout is PAUSED** - Waiting for manual promotion" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Next steps:" >> $GITHUB_STEP_SUMMARY
-            echo "1. Run \`test-preview\` action to verify new version" >> $GITHUB_STEP_SUMMARY
-            echo "2. Run \`promote\` action to switch traffic" >> $GITHUB_STEP_SUMMARY
+            echo "**Test the preview URL above, then run \`promote\` action to switch traffic!**" >> $GITHUB_STEP_SUMMARY
           fi
 
       # ═══════════════════════════════════════════════════════════════════
@@ -133,20 +139,28 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # External URL test
-          echo "### External URL Test" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 External URL Test" >> $GITHUB_STEP_SUMMARY
           PROD_URL="https://opsera-voting-app-${{ github.event.inputs.environment }}.agent.opsera.dev"
+          PREVIEW_URL="https://preview.opsera-voting-app-${{ github.event.inputs.environment }}.agent.opsera.dev"
+
           PROD_STATUS=$(curl -sSL -o /dev/null -w "%{http_code}" "$PROD_URL" 2>/dev/null || echo "000")
           PROD_VER=$(curl -s "$PROD_URL" 2>/dev/null | grep -o 'Version:[^<]*' || echo "Unknown")
 
-          echo "| URL | Status | Version |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Production | $PROD_STATUS | $PROD_VER |" >> $GITHUB_STEP_SUMMARY
+          PREVIEW_EXT_STATUS=$(curl -sSL -o /dev/null -w "%{http_code}" "$PREVIEW_URL" 2>/dev/null || echo "000")
+          PREVIEW_EXT_VER=$(curl -s "$PREVIEW_URL" 2>/dev/null | grep -o 'Version:[^<]*' || echo "Unknown")
+
+          echo "| Service | URL | Status | Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Production** | [Link]($PROD_URL) | $PROD_STATUS | $PROD_VER |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Preview** | [Link]($PREVIEW_URL) | $PREVIEW_EXT_STATUS | $PREVIEW_EXT_VER |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "$PREVIEW_VERSION" != "$ACTIVE_VERSION" ]; then
-            echo "✅ **Preview has different version than Active** - Ready to promote!" >> $GITHUB_STEP_SUMMARY
+          if [ "$PREVIEW_EXT_VER" != "$PROD_VER" ] && [ "$PREVIEW_EXT_STATUS" = "200" ]; then
+            echo "✅ **Preview has different version than Production** - Ready to promote!" >> $GITHUB_STEP_SUMMARY
+          elif [ "$PREVIEW_EXT_STATUS" != "200" ]; then
+            echo "⚠️ **Preview URL not ready yet** - Certificate may still be provisioning" >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️ **Preview and Active have same version**" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Preview and Production have same version**" >> $GITHUB_STEP_SUMMARY
           fi
 
       # ═══════════════════════════════════════════════════════════════════
