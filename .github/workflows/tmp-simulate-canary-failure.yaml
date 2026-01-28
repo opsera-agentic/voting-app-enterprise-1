@@ -1,5 +1,6 @@
 name: "tmp: Simulate Canary Failure & Rollback"
 
+# Simulates canary deployment failures to demonstrate automatic rollback
 on:
   workflow_dispatch:
     inputs:
