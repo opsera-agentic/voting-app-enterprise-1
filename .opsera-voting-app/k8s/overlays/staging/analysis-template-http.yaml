@@ -1,0 +1,29 @@
+# HTTP-Based Analysis Template for Staging Blue-Green
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: http-health-check
+  labels:
+    app.kubernetes.io/part-of: voting-app
+    analysis-type: http-based
+spec:
+  args:
+  - name: service-name
+  - name: namespace
+    value: "voting-app-staging"
+
+  metrics:
+  # HTTP Health Check - Verifies the service endpoint returns HTTP 200
+  - name: http-health
+    interval: 30s
+    count: 3
+    successCondition: result.status == 200
+    failureLimit: 2
+    provider:
+      web:
+        url: "http://{{args.service-name}}.{{args.namespace}}.svc.cluster.local/"
+        method: GET
+        timeoutSeconds: 10
+        headers:
+        - key: "User-Agent"
+          value: "Argo-Rollouts-Analysis"

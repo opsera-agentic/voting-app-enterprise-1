@@ -14,6 +14,8 @@ resources:
   # Preview services for blue-green
   - vote-preview-service.yaml
   - result-preview-service.yaml
+  # Analysis template for blue-green pre-promotion checks
+  - analysis-template-http.yaml
   # Staging: Use Deployments with emptyDir for db/redis (no EBS CSI driver)
   - db-deployment.yaml
   - redis-deployment.yaml
