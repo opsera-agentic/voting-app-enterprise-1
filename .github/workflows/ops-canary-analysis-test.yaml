@@ -22,8 +22,10 @@ env:
 
 jobs:
   switch-and-deploy:
-    name: "Switch to ${{ inputs.provider }}"
+    name: "Canary Analysis Test"
     runs-on: ubuntu-latest
+    outputs:
+      provider: ${{ steps.provider.outputs.value }}
     
     steps:
       - name: Checkout Code
@@ -31,10 +33,22 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
+      - name: Get Provider
+        id: provider
+        run: |
+          # Use input if available, otherwise read from config file
+          if [ -n "${{ inputs.provider }}" ]; then
+            PROVIDER="${{ inputs.provider }}"
+          else
+            PROVIDER=$(cat .github/canary-test-config.txt 2>/dev/null || echo "newrelic")
+          fi
+          echo "value=$PROVIDER" >> $GITHUB_OUTPUT
+          echo "Provider: $PROVIDER"
+
       - name: Determine Template
         id: template
         run: |
-          case "${{ inputs.provider }}" in
+          case "${{ steps.provider.outputs.value }}" in
             newrelic)
               echo "name=newrelic-combined-analysis" >> $GITHUB_OUTPUT
               ;;
@@ -49,7 +63,7 @@ jobs:
       - name: Update Rollout Patch
         run: |
           TEMPLATE="${{ steps.template.outputs.name }}"
-          PROVIDER="${{ inputs.provider }}"
+          PROVIDER="${{ steps.provider.outputs.value }}"
           PATCH_FILE=".opsera-voting-app/k8s/overlays/qa/patch-rollout-replicas.yaml"
           
           echo "## Configuration" >> $GITHUB_STEP_SUMMARY
@@ -164,7 +178,7 @@ jobs:
 
       - name: Update Kustomization
         run: |
-          PROVIDER="${{ inputs.provider }}"
+          PROVIDER="${{ steps.provider.outputs.value }}"
           KUST_FILE=".opsera-voting-app/k8s/overlays/qa/kustomization.yaml"
           
           # Clean up old analysis template patches using perl
@@ -222,7 +236,7 @@ EOF
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git diff --staged --quiet || git commit -m "test(${{ inputs.provider }}): switch canary to ${{ steps.template.outputs.name }}"
+          git diff --staged --quiet || git commit -m "test(${{ steps.provider.outputs.value }}): switch canary to ${{ steps.template.outputs.name }}"
           git push origin main
           
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -293,7 +307,7 @@ EOF
           aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
           
           echo "## Canary Monitoring" >> $GITHUB_STEP_SUMMARY
-          echo "Provider: **${{ inputs.provider }}**" >> $GITHUB_STEP_SUMMARY
+          echo "Provider: **${{ needs.switch-and-deploy.outputs.provider }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           for i in $(seq 1 12); do
