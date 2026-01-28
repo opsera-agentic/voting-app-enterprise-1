@@ -106,10 +106,10 @@ labels:
 images:
   - name: vote
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/vote
-    newTag: d6d7761-20260127224743
+    newTag: 7c27be6-20260128000811
   - name: result
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/result
-    newTag: d6d7761-20260127224743
+    newTag: 7c27be6-20260128000811
   - name: worker
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/worker
-    newTag: d6d7761-20260127224743
+    newTag: 7c27be6-20260128000811
