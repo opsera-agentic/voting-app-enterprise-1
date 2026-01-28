@@ -32,13 +32,6 @@ labels:
       app.kubernetes.io/managed-by: argocd
     includeSelectors: false
 
-images:
-  - name: vote
-    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/vote
-    newTag: latest
-  - name: result
-    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/result
-    newTag: latest
-  - name: worker
-    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/worker
-    newTag: latest
+# NOTE: Images are intentionally NOT defined in base.
+# Each overlay (dev/qa) controls its own image tags via the images: section.
+# This ensures proper version control per environment.
