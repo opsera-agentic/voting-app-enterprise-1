@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: 'Analysis provider (newrelic, prometheus, http)'
+        description: "Analysis provider (newrelic, prometheus, http)"
         required: true
-        default: 'newrelic'
+        default: "newrelic"
   push:
     paths:
-      - '.github/canary-test-config.txt'
+      - ".github/canary-test-config.txt"
 
 permissions:
   contents: write
@@ -26,7 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       provider: ${{ steps.provider.outputs.value }}
-    
+      template: ${{ steps.template.outputs.name }}
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -36,19 +37,19 @@ jobs:
       - name: Get Provider
         id: provider
         run: |
-          # Use input if available, otherwise read from config file
           if [ -n "${{ inputs.provider }}" ]; then
             PROVIDER="${{ inputs.provider }}"
           else
             PROVIDER=$(cat .github/canary-test-config.txt 2>/dev/null || echo "newrelic")
           fi
           echo "value=$PROVIDER" >> $GITHUB_OUTPUT
-          echo "Provider: $PROVIDER"
+          echo "Using provider: $PROVIDER"
 
       - name: Determine Template
         id: template
         run: |
-          case "${{ steps.provider.outputs.value }}" in
+          PROVIDER="${{ steps.provider.outputs.value }}"
+          case "$PROVIDER" in
             newrelic)
               echo "name=newrelic-combined-analysis" >> $GITHUB_OUTPUT
               ;;
@@ -60,176 +61,133 @@ jobs:
               ;;
           esac
 
-      - name: Update Rollout Patch
+      - name: Update Rollout Config
         run: |
-          TEMPLATE="${{ steps.template.outputs.name }}"
           PROVIDER="${{ steps.provider.outputs.value }}"
-          PATCH_FILE=".opsera-voting-app/k8s/overlays/qa/patch-rollout-replicas.yaml"
+          TEMPLATE="${{ steps.template.outputs.name }}"
           
           echo "## Configuration" >> $GITHUB_STEP_SUMMARY
           echo "- Provider: **$PROVIDER**" >> $GITHUB_STEP_SUMMARY
           echo "- Template: **$TEMPLATE**" >> $GITHUB_STEP_SUMMARY
           
-          # Set args based on provider
-          if [ "$PROVIDER" = "newrelic" ]; then
-            VOTE_ARGS="args:
-                  - name: app-name
-                    value: vote
-                  - name: error-threshold
-                    value: \"5\"
-                  - name: latency-threshold
-                    value: \"500\"
-                  - name: apdex-threshold
-                    value: \"0.85\""
-            RESULT_ARGS="args:
-                  - name: app-name
-                    value: result
-                  - name: error-threshold
-                    value: \"5\"
-                  - name: latency-threshold
-                    value: \"500\"
-                  - name: apdex-threshold
-                    value: \"0.85\""
-          elif [ "$PROVIDER" = "prometheus" ]; then
-            VOTE_ARGS="args:
-                  - name: service-name
-                    value: vote
-                  - name: ingress-name
-                    value: voting-app"
-            RESULT_ARGS="args:
-                  - name: service-name
-                    value: result
-                  - name: ingress-name
-                    value: voting-app-result"
-          else
-            VOTE_ARGS="args:
-                  - name: service-name
-                    value: vote
-                  - name: namespace
-                    value: voting-app-qa"
-            RESULT_ARGS="args:
-                  - name: service-name
-                    value: result
-                  - name: namespace
-                    value: voting-app-qa"
-          fi
+          # Update patch file using Python for cleaner YAML generation
+          python3 << PYEOF
+          import yaml
           
-          cat > "$PATCH_FILE" << EOFPATCH
-          # QA - Testing $PROVIDER canary analysis
-          apiVersion: argoproj.io/v1alpha1
-          kind: Rollout
-          metadata:
-            name: vote-rollout
-          spec:
-            replicas: 4
-            strategy:
-              canary:
-                steps:
-                - setWeight: 10
-                - pause: {duration: 1m}
-                - setWeight: 30
-                - pause: {duration: 1m}
-                - setWeight: 60
-                - pause: {duration: 1m}
-                - setWeight: 100
-                analysis:
-                  templates:
-                  - templateName: $TEMPLATE
-                  startingStep: 1
-                  $VOTE_ARGS
-                trafficRouting:
-                  nginx:
-                    stableIngress: voting-app
-                    annotationPrefix: nginx.ingress.kubernetes.io
-          ---
-          apiVersion: argoproj.io/v1alpha1
-          kind: Rollout
-          metadata:
-            name: result-rollout
-          spec:
-            replicas: 3
-            strategy:
-              canary:
-                steps:
-                - setWeight: 10
-                - pause: {duration: 1m}
-                - setWeight: 30
-                - pause: {duration: 1m}
-                - setWeight: 60
-                - pause: {duration: 1m}
-                - setWeight: 100
-                analysis:
-                  templates:
-                  - templateName: $TEMPLATE
-                  startingStep: 1
-                  $RESULT_ARGS
-                trafficRouting:
-                  nginx:
-                    stableIngress: voting-app-result
-                    annotationPrefix: nginx.ingress.kubernetes.io
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: worker
-          spec:
-            replicas: 2
-          EOFPATCH
-
-      - name: Update Kustomization
-        run: |
-          PROVIDER="${{ steps.provider.outputs.value }}"
-          KUST_FILE=".opsera-voting-app/k8s/overlays/qa/kustomization.yaml"
+          provider = "$PROVIDER"
+          template = "$TEMPLATE"
           
-          # Clean up old analysis template patches using perl
-          perl -i -0pe 's/\s*#\s*(?:Exclude|Keep|Testing).*?AnalysisTemplate.*?name:\s*\w+[-\w]*\n//gs' "$KUST_FILE" || true
+          if provider == "newrelic":
+              vote_args = [
+                  {"name": "app-name", "value": "vote"},
+                  {"name": "error-threshold", "value": "5"},
+                  {"name": "latency-threshold", "value": "500"},
+                  {"name": "apdex-threshold", "value": "0.85"}
+              ]
+              result_args = [
+                  {"name": "app-name", "value": "result"},
+                  {"name": "error-threshold", "value": "5"},
+                  {"name": "latency-threshold", "value": "500"},
+                  {"name": "apdex-threshold", "value": "0.85"}
+              ]
+          elif provider == "prometheus":
+              vote_args = [
+                  {"name": "service-name", "value": "vote"},
+                  {"name": "ingress-name", "value": "voting-app"}
+              ]
+              result_args = [
+                  {"name": "service-name", "value": "result"},
+                  {"name": "ingress-name", "value": "voting-app-result"}
+              ]
+          else:
+              vote_args = [
+                  {"name": "service-name", "value": "vote"},
+                  {"name": "namespace", "value": "voting-app-qa"}
+              ]
+              result_args = [
+                  {"name": "service-name", "value": "result"},
+                  {"name": "namespace", "value": "voting-app-qa"}
+              ]
           
-          # Add patches based on provider
-          if [ "$PROVIDER" = "newrelic" ]; then
-            cat >> "$KUST_FILE" << 'EOF'
-  # Testing New Relic - keep NR templates, delete Prometheus
-  - target:
-      kind: AnalysisTemplate
-      name: success-rate
-    patch: |-
-      $patch: delete
-      apiVersion: argoproj.io/v1alpha1
-      kind: AnalysisTemplate
-      metadata:
-        name: success-rate
-EOF
-          elif [ "$PROVIDER" = "prometheus" ]; then
-            cat >> "$KUST_FILE" << 'EOF'
-  # Testing Prometheus - keep success-rate, delete NR templates  
-  - target:
-      kind: AnalysisTemplate
-      name: newrelic-analysis
-    patch: |-
-      $patch: delete
-      apiVersion: argoproj.io/v1alpha1
-      kind: AnalysisTemplate
-      metadata:
-        name: newrelic-analysis
-  - target:
-      kind: AnalysisTemplate
-      name: newrelic-nrql-analysis
-    patch: |-
-      $patch: delete
-      apiVersion: argoproj.io/v1alpha1
-      kind: AnalysisTemplate
-      metadata:
-        name: newrelic-nrql-analysis
-  - target:
-      kind: AnalysisTemplate
-      name: newrelic-combined-analysis
-    patch: |-
-      $patch: delete
-      apiVersion: argoproj.io/v1alpha1
-      kind: AnalysisTemplate
-      metadata:
-        name: newrelic-combined-analysis
-EOF
-          fi
+          docs = [
+              {
+                  "apiVersion": "argoproj.io/v1alpha1",
+                  "kind": "Rollout",
+                  "metadata": {"name": "vote-rollout"},
+                  "spec": {
+                      "replicas": 4,
+                      "strategy": {
+                          "canary": {
+                              "steps": [
+                                  {"setWeight": 10},
+                                  {"pause": {"duration": "1m"}},
+                                  {"setWeight": 30},
+                                  {"pause": {"duration": "1m"}},
+                                  {"setWeight": 60},
+                                  {"pause": {"duration": "1m"}},
+                                  {"setWeight": 100}
+                              ],
+                              "analysis": {
+                                  "templates": [{"templateName": template}],
+                                  "startingStep": 1,
+                                  "args": vote_args
+                              },
+                              "trafficRouting": {
+                                  "nginx": {
+                                      "stableIngress": "voting-app",
+                                      "annotationPrefix": "nginx.ingress.kubernetes.io"
+                                  }
+                              }
+                          }
+                      }
+                  }
+              },
+              {
+                  "apiVersion": "argoproj.io/v1alpha1",
+                  "kind": "Rollout",
+                  "metadata": {"name": "result-rollout"},
+                  "spec": {
+                      "replicas": 3,
+                      "strategy": {
+                          "canary": {
+                              "steps": [
+                                  {"setWeight": 10},
+                                  {"pause": {"duration": "1m"}},
+                                  {"setWeight": 30},
+                                  {"pause": {"duration": "1m"}},
+                                  {"setWeight": 60},
+                                  {"pause": {"duration": "1m"}},
+                                  {"setWeight": 100}
+                              ],
+                              "analysis": {
+                                  "templates": [{"templateName": template}],
+                                  "startingStep": 1,
+                                  "args": result_args
+                              },
+                              "trafficRouting": {
+                                  "nginx": {
+                                      "stableIngress": "voting-app-result",
+                                      "annotationPrefix": "nginx.ingress.kubernetes.io"
+                                  }
+                              }
+                          }
+                      }
+                  }
+              },
+              {
+                  "apiVersion": "apps/v1",
+                  "kind": "Deployment",
+                  "metadata": {"name": "worker"},
+                  "spec": {"replicas": 2}
+              }
+          ]
+          
+          with open(".opsera-voting-app/k8s/overlays/qa/patch-rollout-replicas.yaml", "w") as f:
+              f.write(f"# QA - Testing {provider} canary analysis\n")
+              yaml.dump_all(docs, f, default_flow_style=False)
+          
+          print(f"Updated patch file for {provider}")
+          PYEOF
 
       - name: Commit Changes
         run: |
@@ -237,7 +195,7 @@ EOF
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
           git diff --staged --quiet || git commit -m "test(${{ steps.provider.outputs.value }}): switch canary to ${{ steps.template.outputs.name }}"
-          git push origin main
+          git push origin main || echo "Nothing to push"
           
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Changes Committed" >> $GITHUB_STEP_SUMMARY
@@ -285,7 +243,7 @@ EOF
     name: "Monitor Canary"
     runs-on: ubuntu-latest
     needs: [switch-and-deploy]
-    
+
     steps:
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
@@ -308,6 +266,7 @@ EOF
           
           echo "## Canary Monitoring" >> $GITHUB_STEP_SUMMARY
           echo "Provider: **${{ needs.switch-and-deploy.outputs.provider }}**" >> $GITHUB_STEP_SUMMARY
+          echo "Template: **${{ needs.switch-and-deploy.outputs.template }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           for i in $(seq 1 12); do
@@ -325,9 +284,8 @@ EOF
             
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Analysis Runs:**" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
             kubectl get analysisruns -n voting-app-qa --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -5 >> $GITHUB_STEP_SUMMARY || echo "None found" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
             echo "---" >> $GITHUB_STEP_SUMMARY
             
             if [ "$PHASE" = "Healthy" ]; then
@@ -346,6 +304,4 @@ EOF
           
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## Final Rollout Status" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
           kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 >> $GITHUB_STEP_SUMMARY || true
-          echo '```' >> $GITHUB_STEP_SUMMARY
