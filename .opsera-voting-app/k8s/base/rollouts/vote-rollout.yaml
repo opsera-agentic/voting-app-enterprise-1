@@ -108,10 +108,10 @@ spec:
       - setWeight: 100
 
       # Automated analysis using New Relic metrics
-      # Options: success-rate (Prometheus), newrelic-combined-analysis (New Relic)
+      # Options: success-rate (Prometheus), newrelic-combined-analysis (web), newrelic-job-analysis (job - recommended)
       analysis:
         templates:
-        - templateName: newrelic-combined-analysis
+        - templateName: newrelic-job-analysis
         startingStep: 1
         args:
         - name: app-name
