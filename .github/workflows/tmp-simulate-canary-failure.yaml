@@ -1,0 +1,600 @@
+name: "tmp: Simulate Canary Failure & Rollback"
+
+on:
+  workflow_dispatch:
+    inputs:
+      failure_type:
+        description: "Type of failure to simulate"
+        required: true
+        type: choice
+        options:
+          - latency
+          - error_rate
+          - crash
+        default: "latency"
+      latency_ms:
+        description: "Latency to inject (ms) - for latency type"
+        required: false
+        default: "2000"
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+jobs:
+  inject-failure:
+    name: "💉 Inject Failure"
+    runs-on: ubuntu-latest
+    outputs:
+      original_code: ${{ steps.backup.outputs.code }}
+      
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Backup Original Code
+        id: backup
+        run: |
+          # Store original app.py hash for rollback reference
+          HASH=$(sha256sum vote/app.py | cut -d' ' -f1)
+          echo "code=$HASH" >> $GITHUB_OUTPUT
+          echo "Original code hash: $HASH"
+
+      - name: Inject Latency Failure
+        if: ${{ inputs.failure_type == 'latency' }}
+        run: |
+          LATENCY="${{ inputs.latency_ms }}"
+          
+          echo "## 💉 Injecting Latency Failure" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Latency:** ${LATENCY}ms" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "This will cause the canary analysis to detect slow response times and trigger a rollback." >> $GITHUB_STEP_SUMMARY
+          
+          # Inject sleep at the start of the main route
+          cat > vote/app.py << 'PYEOF'
+from flask import Flask, render_template, request, make_response, g
+from redis import Redis
+import os
+import socket
+import random
+import json
+import logging
+import time
+
+# ===== FAILURE INJECTION =====
+INJECTED_LATENCY_MS = int(os.environ.get('INJECTED_LATENCY_MS', '2000'))
+# =============================
+
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+hostname = socket.gethostname()
+
+app = Flask(__name__)
+
+gunicorn_error_logger = logging.getLogger('gunicorn.error')
+app.logger.handlers.extend(gunicorn_error_logger.handlers)
+app.logger.setLevel(logging.INFO)
+
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+
+@app.route("/", methods=['POST','GET'])
+def hello():
+    # ===== INJECTED LATENCY =====
+    if INJECTED_LATENCY_MS > 0:
+        app.logger.warning(f"⚠️ SIMULATED LATENCY: Sleeping for {INJECTED_LATENCY_MS}ms")
+        time.sleep(INJECTED_LATENCY_MS / 1000.0)
+    # ============================
+    
+    voter_id = request.cookies.get('voter_id')
+    if not voter_id:
+        voter_id = hex(random.getrandbits(64))[2:-1]
+
+    vote = None
+
+    if request.method == 'POST':
+        redis = get_redis()
+        vote = request.form['vote']
+        app.logger.info('Received vote for %s', vote)
+        data = json.dumps({'voter_id': voter_id, 'vote': vote})
+        redis.rpush('votes', data)
+
+    resp = make_response(render_template(
+        'index.html',
+        option_a=option_a,
+        option_b=option_b,
+        hostname=hostname,
+        vote=vote,
+    ))
+    resp.set_cookie('voter_id', voter_id)
+    return resp
+
+@app.route("/health")
+def health():
+    # Health check also affected by latency
+    if INJECTED_LATENCY_MS > 500:
+        app.logger.warning(f"⚠️ HEALTH CHECK DELAYED: {INJECTED_LATENCY_MS}ms")
+        time.sleep(min(INJECTED_LATENCY_MS / 1000.0, 1.5))  # Cap at 1.5s for health
+    return "OK"
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+PYEOF
+
+          # Update the version to indicate bad release
+          sed -i 's/Version: v[0-9]*/Version: v99-BAD-LATENCY/g' vote/templates/index.html
+          sed -i 's/🚀/💀/g' vote/templates/index.html
+          
+          # Add env var to Dockerfile
+          echo "" >> vote/Dockerfile
+          echo "# Injected latency for canary failure simulation" >> vote/Dockerfile
+          echo "ENV INJECTED_LATENCY_MS=$LATENCY" >> vote/Dockerfile
+
+      - name: Inject Error Rate Failure
+        if: ${{ inputs.failure_type == 'error_rate' }}
+        run: |
+          echo "## 💉 Injecting Error Rate Failure" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "This will cause random 500 errors on 50% of requests." >> $GITHUB_STEP_SUMMARY
+          
+          cat > vote/app.py << 'PYEOF'
+from flask import Flask, render_template, request, make_response, g
+from redis import Redis
+import os
+import socket
+import random
+import json
+import logging
+
+# ===== FAILURE INJECTION =====
+ERROR_RATE = float(os.environ.get('ERROR_RATE', '0.5'))  # 50% errors
+# =============================
+
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+hostname = socket.gethostname()
+
+app = Flask(__name__)
+
+gunicorn_error_logger = logging.getLogger('gunicorn.error')
+app.logger.handlers.extend(gunicorn_error_logger.handlers)
+app.logger.setLevel(logging.INFO)
+
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+
+@app.route("/", methods=['POST','GET'])
+def hello():
+    # ===== INJECTED ERROR =====
+    if random.random() < ERROR_RATE:
+        app.logger.error("💀 SIMULATED ERROR: Random 500 triggered")
+        return "Internal Server Error - Simulated Failure", 500
+    # ==========================
+    
+    voter_id = request.cookies.get('voter_id')
+    if not voter_id:
+        voter_id = hex(random.getrandbits(64))[2:-1]
+
+    vote = None
+
+    if request.method == 'POST':
+        redis = get_redis()
+        vote = request.form['vote']
+        app.logger.info('Received vote for %s', vote)
+        data = json.dumps({'voter_id': voter_id, 'vote': vote})
+        redis.rpush('votes', data)
+
+    resp = make_response(render_template(
+        'index.html',
+        option_a=option_a,
+        option_b=option_b,
+        hostname=hostname,
+        vote=vote,
+    ))
+    resp.set_cookie('voter_id', voter_id)
+    return resp
+
+@app.route("/health")
+def health():
+    return "OK"
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+PYEOF
+
+          sed -i 's/Version: v[0-9]*/Version: v99-BAD-ERRORS/g' vote/templates/index.html
+          sed -i 's/🚀/💀/g' vote/templates/index.html
+
+      - name: Inject Crash Failure
+        if: ${{ inputs.failure_type == 'crash' }}
+        run: |
+          echo "## 💉 Injecting Crash Failure" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "This will cause the app to crash after 30 seconds." >> $GITHUB_STEP_SUMMARY
+          
+          cat > vote/app.py << 'PYEOF'
+from flask import Flask, render_template, request, make_response, g
+from redis import Redis
+import os
+import socket
+import random
+import json
+import logging
+import threading
+import time
+import sys
+
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+hostname = socket.gethostname()
+
+app = Flask(__name__)
+
+gunicorn_error_logger = logging.getLogger('gunicorn.error')
+app.logger.handlers.extend(gunicorn_error_logger.handlers)
+app.logger.setLevel(logging.INFO)
+
+# ===== CRASH INJECTION =====
+def delayed_crash():
+    time.sleep(30)
+    app.logger.critical("💀 SIMULATED CRASH: Exiting process!")
+    sys.exit(1)
+
+crash_thread = threading.Thread(target=delayed_crash, daemon=True)
+crash_thread.start()
+# ===========================
+
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+
+@app.route("/", methods=['POST','GET'])
+def hello():
+    voter_id = request.cookies.get('voter_id')
+    if not voter_id:
+        voter_id = hex(random.getrandbits(64))[2:-1]
+
+    vote = None
+
+    if request.method == 'POST':
+        redis = get_redis()
+        vote = request.form['vote']
+        app.logger.info('Received vote for %s', vote)
+        data = json.dumps({'voter_id': voter_id, 'vote': vote})
+        redis.rpush('votes', data)
+
+    resp = make_response(render_template(
+        'index.html',
+        option_a=option_a,
+        option_b=option_b,
+        hostname=hostname,
+        vote=vote,
+    ))
+    resp.set_cookie('voter_id', voter_id)
+    return resp
+
+@app.route("/health")
+def health():
+    return "OK"
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+PYEOF
+
+          sed -i 's/Version: v[0-9]*/Version: v99-WILL-CRASH/g' vote/templates/index.html
+          sed -i 's/🚀/💀/g' vote/templates/index.html
+
+      - name: Commit Bad Code
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "💀 INTENTIONAL BAD RELEASE: ${{ inputs.failure_type }} failure simulation"
+          git push
+
+  build-bad-image:
+    name: "🔨 Build Bad Image"
+    needs: inject-failure
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          
+      - name: Pull Latest
+        run: git pull origin main
+
+      - name: Generate Tag
+        id: tag
+        run: |
+          TAG="bad-$(date +%Y%m%d%H%M%S)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "## 🏷️ Image Tag: \`$TAG\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin 792373136340.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Build & Push Bad Vote Image
+        run: |
+          cd vote
+          docker build -t 792373136340.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/vote:${{ steps.tag.outputs.tag }} .
+          docker push 792373136340.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/vote:${{ steps.tag.outputs.tag }}
+          
+          echo "## ✅ Bad image pushed" >> $GITHUB_STEP_SUMMARY
+
+  deploy-and-watch:
+    name: "🎯 Deploy & Watch Rollback"
+    needs: build-bad-image
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          ref: main
+          
+      - name: Pull Latest
+        run: git pull origin main
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -sLO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl -sLO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Update QA to Bad Image
+        run: |
+          BAD_TAG="${{ needs.build-bad-image.outputs.image_tag }}"
+          
+          # Update only vote image (keep result/worker stable)
+          cd .opsera-voting-app/k8s/overlays/qa
+          
+          # Use yq or sed to update just the vote image
+          sed -i "s|newTag:.*|newTag: $BAD_TAG|" kustomization.yaml
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "💀 Deploy bad canary: $BAD_TAG"
+          git push
+
+      - name: Sync ArgoCD
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          kubectl patch application voting-app-qa -n argocd \
+            --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+          sleep 5
+          kubectl patch application voting-app-qa -n argocd \
+            --type merge -p '{"operation":{"initiatedBy":{"username":"gha"},"sync":{"prune":true}}}'
+
+      - name: Watch Canary Failure & Rollback
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "# 🎯 Canary Failure Simulation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Failure Type:** ${{ inputs.failure_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Bad Image:** \`${{ needs.build-bad-image.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait for rollout to start
+          sleep 30
+          
+          # Restart rollout to pick up new image
+          kubectl-argo-rollouts restart vote-rollout -n voting-app-qa || true
+          
+          echo "## 📈 Canary Progress" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          PREV_PHASE=""
+          ROLLBACK_DETECTED=false
+          
+          for i in $(seq 1 40); do  # 10 minutes max
+            PHASE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            WEIGHT=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.canary.weight}' 2>/dev/null || echo "0")
+            
+            if [ "$PHASE" != "$PREV_PHASE" ]; then
+              TIME=$(date -u '+%H:%M:%S')
+              
+              case "$PHASE" in
+                Healthy) 
+                  if [ "$ROLLBACK_DETECTED" = true ]; then
+                    EMOJI="✅"
+                    echo "### $EMOJI $TIME - Rollback Complete!" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "**The canary deployment failed and automatically rolled back to the stable version.**" >> $GITHUB_STEP_SUMMARY
+                  else
+                    EMOJI="✅"
+                    echo "### $EMOJI $TIME - $PHASE (Weight: ${WEIGHT}%)" >> $GITHUB_STEP_SUMMARY
+                  fi
+                  ;;
+                Progressing) 
+                  EMOJI="🔄"
+                  echo "### $EMOJI $TIME - Canary Progressing (Weight: ${WEIGHT}%)" >> $GITHUB_STEP_SUMMARY
+                  ;;
+                Degraded) 
+                  EMOJI="❌"
+                  ROLLBACK_DETECTED=true
+                  echo "### $EMOJI $TIME - CANARY FAILED! Rollback Triggered!" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  
+                  # Get failure reason
+                  LATEST_AR=$(kubectl get analysisruns -n voting-app-qa --sort-by='.metadata.creationTimestamp' -o name 2>/dev/null | tail -1)
+                  if [ -n "$LATEST_AR" ]; then
+                    AR_MSG=$(kubectl get $LATEST_AR -n voting-app-qa -o jsonpath='{.status.message}' 2>/dev/null || echo "")
+                    echo "**Failure Reason:** $AR_MSG" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    
+                    echo "<details><summary>📊 Failed Metrics</summary>" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo '```' >> $GITHUB_STEP_SUMMARY
+                    kubectl get $LATEST_AR -n voting-app-qa -o jsonpath='{.status.metricResults}' 2>/dev/null | jq -r '.[] | "Metric: \(.name)\n  Phase: \(.phase)\n  Measurements: \(.count)\n  Message: \(.message // "N/A")\n"' 2>/dev/null || echo "No metrics"
+                    echo '```' >> $GITHUB_STEP_SUMMARY
+                    echo "</details>" >> $GITHUB_STEP_SUMMARY
+                  fi
+                  ;;
+                *) 
+                  EMOJI="⏳"
+                  echo "### $EMOJI $TIME - $PHASE" >> $GITHUB_STEP_SUMMARY
+                  ;;
+              esac
+              
+              echo "" >> $GITHUB_STEP_SUMMARY
+              PREV_PHASE="$PHASE"
+            fi
+            
+            # Exit conditions
+            if [ "$PHASE" = "Healthy" ] && [ "$ROLLBACK_DETECTED" = true ]; then
+              echo "---" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "## 🎉 Simulation Complete!" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "The canary analysis detected the ${{ inputs.failure_type }} issue and automatically rolled back." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**This demonstrates:**" >> $GITHUB_STEP_SUMMARY
+              echo "- ✅ Progressive delivery with canary analysis" >> $GITHUB_STEP_SUMMARY
+              echo "- ✅ Automatic failure detection" >> $GITHUB_STEP_SUMMARY
+              echo "- ✅ Zero-downtime rollback" >> $GITHUB_STEP_SUMMARY
+              echo "- ✅ Production safety guardrails" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            
+            sleep 15
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Final Rollout Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  restore-good-code:
+    name: "🔧 Restore Good Code"
+    needs: deploy-and-watch
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          ref: main
+          
+      - name: Pull Latest
+        run: git pull origin main
+
+      - name: Restore Original Vote App
+        run: |
+          # Restore the original app.py
+          cat > vote/app.py << 'PYEOF'
+from flask import Flask, render_template, request, make_response, g
+from redis import Redis
+import os
+import socket
+import random
+import json
+import logging
+
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+hostname = socket.gethostname()
+
+app = Flask(__name__)
+
+gunicorn_error_logger = logging.getLogger('gunicorn.error')
+app.logger.handlers.extend(gunicorn_error_logger.handlers)
+app.logger.setLevel(logging.INFO)
+
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+
+@app.route("/", methods=['POST','GET'])
+def hello():
+    voter_id = request.cookies.get('voter_id')
+    if not voter_id:
+        voter_id = hex(random.getrandbits(64))[2:-1]
+
+    vote = None
+
+    if request.method == 'POST':
+        redis = get_redis()
+        vote = request.form['vote']
+        app.logger.info('Received vote for %s', vote)
+        data = json.dumps({'voter_id': voter_id, 'vote': vote})
+        redis.rpush('votes', data)
+
+    resp = make_response(render_template(
+        'index.html',
+        option_a=option_a,
+        option_b=option_b,
+        hostname=hostname,
+        vote=vote,
+    ))
+    resp.set_cookie('voter_id', voter_id)
+    return resp
+
+@app.route("/health")
+def health():
+    return "OK"
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+PYEOF
+
+          # Restore version in template
+          sed -i 's/Version: v99-[A-Z-]*/Version: v14 (Purple\/Orange Theme)/g' vote/templates/index.html
+          sed -i 's/💀/🚀/g' vote/templates/index.html
+          
+          # Remove any injected env vars from Dockerfile
+          grep -v "INJECTED_LATENCY" vote/Dockerfile > vote/Dockerfile.tmp || cp vote/Dockerfile vote/Dockerfile.tmp
+          mv vote/Dockerfile.tmp vote/Dockerfile
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "🔧 Restore good code after canary failure simulation"
+          git push || echo "Nothing to push"
+          
+          echo "## ✅ Good code restored" >> $GITHUB_STEP_SUMMARY
