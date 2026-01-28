@@ -40,8 +40,14 @@ jobs:
           if [ -n "${{ inputs.provider }}" ]; then
             PROVIDER="${{ inputs.provider }}"
           else
-            PROVIDER=$(cat .github/canary-test-config.txt 2>/dev/null || echo "newrelic")
+            # Read first word only, ignore comments and whitespace
+            PROVIDER=$(cat .github/canary-test-config.txt 2>/dev/null | awk '{print $1}' | head -1 || echo "newrelic")
           fi
+          # Validate provider
+          case "$PROVIDER" in
+            newrelic|prometheus|http) ;;
+            *) PROVIDER="http" ;;
+          esac
           echo "value=$PROVIDER" >> $GITHUB_OUTPUT
           echo "Using provider: $PROVIDER"
 
