@@ -38,6 +38,44 @@ patches:
       kind: StatefulSet
       metadata:
         name: redis
+  # Exclude NewRelic AnalysisTemplates (use http-health-check instead)
+  # These have invalid secretKeyRef in headers which Argo Rollouts doesn't support
+  - target:
+      kind: AnalysisTemplate
+      name: newrelic-analysis
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: newrelic-analysis
+  - target:
+      kind: AnalysisTemplate
+      name: newrelic-nrql-analysis
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: newrelic-nrql-analysis
+  - target:
+      kind: AnalysisTemplate
+      name: newrelic-combined-analysis
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: newrelic-combined-analysis
+  - target:
+      kind: AnalysisTemplate
+      name: success-rate
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: success-rate
   # Scale down standard Deployments to 0 (Rollouts will handle traffic)
   - target:
       kind: Deployment
