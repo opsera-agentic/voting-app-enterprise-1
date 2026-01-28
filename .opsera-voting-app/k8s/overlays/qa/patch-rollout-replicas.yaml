@@ -1,4 +1,4 @@
-# QA - Testing newrelic canary analysis
+# QA - Testing http canary analysis
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
@@ -9,19 +9,13 @@ spec:
     canary:
       analysis:
         args:
-        - name: app-name
+        - name: service-name
           value: vote
-        - name: error-threshold
-          value: '5'
-        - name: latency-threshold
-          value: '500'
-        - name: apdex-threshold
-          value: '0.85'
-        - name: nr-api-url
-          value: https://opsera-nrmock-labs.agent.opsera.dev
+        - name: namespace
+          value: voting-app-qa
         startingStep: 1
         templates:
-        - templateName: newrelic-job-analysis
+        - templateName: http-health-check
       steps:
       - setWeight: 10
       - pause:
@@ -48,19 +42,13 @@ spec:
     canary:
       analysis:
         args:
-        - name: app-name
+        - name: service-name
           value: result
-        - name: error-threshold
-          value: '5'
-        - name: latency-threshold
-          value: '500'
-        - name: apdex-threshold
-          value: '0.85'
-        - name: nr-api-url
-          value: https://opsera-nrmock-labs.agent.opsera.dev
+        - name: namespace
+          value: voting-app-qa
         startingStep: 1
         templates:
-        - templateName: newrelic-job-analysis
+        - templateName: http-health-check
       steps:
       - setWeight: 10
       - pause:
