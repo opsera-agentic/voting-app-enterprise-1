@@ -1,0 +1,82 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: result-rollout
+  labels:
+    app.kubernetes.io/name: result
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: voting-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: result
+  template:
+    metadata:
+      labels:
+        app: result
+        app.kubernetes.io/name: result
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: result
+        image: result:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: PORT
+          value: "8080"
+        - name: ENVIRONMENT
+          value: "staging"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+  strategy:
+    blueGreen:
+      # Active service receives production traffic
+      activeService: result
+      # Preview service receives traffic during promotion testing
+      previewService: result-preview
+      # Automatic promotion after preview passes
+      autoPromotionEnabled: true
+      # Time to wait before promoting (gives time to verify preview)
+      autoPromotionSeconds: 60
+      # Scale down ReplicaSet after switch
+      scaleDownDelaySeconds: 30
+      # Revision history limit
+      scaleDownDelayRevisionLimit: 2
+      # Pre-promotion analysis
+      prePromotionAnalysis:
+        templates:
+        - templateName: http-health-check
+        args:
+        - name: service-name
+          value: result-preview
+        - name: namespace
+          value: voting-app-staging

@@ -1,0 +1,118 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: vote-rollout
+  labels:
+    app.kubernetes.io/name: vote
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: voting-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vote
+  template:
+    metadata:
+      labels:
+        app: vote
+        app.kubernetes.io/name: vote
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: vote
+        image: vote:latest
+        imagePullPolicy: Always
+        command: ["gunicorn"]
+        args: ["app:app", "-b", "0.0.0.0:8080", "--log-file", "-", "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: OPTION_A
+          valueFrom:
+            configMapKeyRef:
+              name: voting-app-config
+              key: OPTION_A
+        - name: OPTION_B
+          valueFrom:
+            configMapKeyRef:
+              name: voting-app-config
+              key: OPTION_B
+        - name: NEW_RELIC_APP_NAME
+          value: "vote-staging"
+        - name: NEW_RELIC_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - name: NEW_RELIC_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: newrelic-config
+              key: NEW_RELIC_HOST
+        - name: NEW_RELIC_LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: newrelic-config
+              key: NEW_RELIC_LOG_LEVEL
+        - name: NEW_RELIC_DISTRIBUTED_TRACING_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: newrelic-config
+              key: NEW_RELIC_DISTRIBUTED_TRACING_ENABLED
+        - name: ENVIRONMENT
+          value: "staging"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+  strategy:
+    blueGreen:
+      # Active service receives production traffic
+      activeService: vote
+      # Preview service receives traffic during promotion testing
+      previewService: vote-preview
+      # Automatic promotion after preview passes (set to false for manual promotion)
+      autoPromotionEnabled: true
+      # Time to wait before promoting (gives time to verify preview)
+      autoPromotionSeconds: 60
+      # Scale down ReplicaSet after switch (reduces resource usage)
+      scaleDownDelaySeconds: 30
+      # Revision history limit
+      scaleDownDelayRevisionLimit: 2
+      # Pre-promotion analysis (optional)
+      prePromotionAnalysis:
+        templates:
+        - templateName: http-health-check
+        args:
+        - name: service-name
+          value: vote-preview
+        - name: namespace
+          value: voting-app-staging
+      # Anti-affinity for spreading pods
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100

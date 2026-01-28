@@ -1,0 +1,33 @@
+# Stable ingress for result app - Staging environment
+# Blue-Green: All traffic goes to active service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voting-app-result
+  labels:
+    environment: staging
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # WebSocket support for socket.io
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - results.opsera-voting-app-staging.agent.opsera.dev
+    secretName: voting-app-result-staging-tls
+  rules:
+  - host: results.opsera-voting-app-staging.agent.opsera.dev
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: result
+            port:
+              number: 80

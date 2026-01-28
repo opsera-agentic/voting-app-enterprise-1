@@ -1,0 +1,78 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: voting-app-staging
+
+namespace: voting-app-staging
+
+resources:
+  - ../../base
+  # Staging: Use Blue-Green Rollouts (different from QA canary)
+  - vote-rollout-bluegreen.yaml
+  - result-rollout-bluegreen.yaml
+  # Preview services for blue-green
+  - vote-preview-service.yaml
+  - result-preview-service.yaml
+  # Staging: Use Deployments with emptyDir for db/redis (no EBS CSI driver)
+  - db-deployment.yaml
+  - redis-deployment.yaml
+  # Separate ingress for result app
+  - result-ingress.yaml
+
+# Exclude standard Deployments from base (replaced by Blue-Green Rollouts)
+patches:
+  # Remove StatefulSets (using Deployments with emptyDir for staging)
+  - target:
+      kind: StatefulSet
+      name: db
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: db
+  - target:
+      kind: StatefulSet
+      name: redis
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis
+  # Scale down standard Deployments to 0 (Blue-Green Rollouts will handle traffic)
+  - target:
+      kind: Deployment
+      name: vote
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 0
+  - target:
+      kind: Deployment
+      name: result
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 0
+  # Patch ingress for staging hostname
+  - path: patch-ingress.yaml
+
+# Use labels transformer to avoid modifying immutable selectors
+labels:
+  - pairs:
+      environment: staging
+      deployment-strategy: bluegreen
+    includeSelectors: false
+
+images:
+  - name: vote
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/vote
+    newTag: b7558ce-20260128033418
+  - name: result
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/result
+    newTag: b7558ce-20260128033418
+  - name: worker
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/worker
+    newTag: b7558ce-20260128033418
