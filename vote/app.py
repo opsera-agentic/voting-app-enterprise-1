@@ -5,9 +5,6 @@ import socket
 import random
 import json
 import logging
-import time
-
-LATENCY_SECONDS = 2.0
 
 option_a = os.getenv('OPTION_A', "Cats")
 option_b = os.getenv('OPTION_B', "Dogs")
@@ -26,9 +23,6 @@ def get_redis():
 
 @app.route("/", methods=['POST','GET'])
 def hello():
-    app.logger.warning(f"INJECTED LATENCY: Sleeping for {LATENCY_SECONDS}s")
-    time.sleep(LATENCY_SECONDS)
-
     voter_id = request.cookies.get('voter_id')
     if not voter_id:
         voter_id = hex(random.getrandbits(64))[2:-1]
@@ -54,7 +48,6 @@ def hello():
 
 @app.route("/health")
 def health():
-    time.sleep(1.0)
     return "OK"
 
 if __name__ == "__main__":
