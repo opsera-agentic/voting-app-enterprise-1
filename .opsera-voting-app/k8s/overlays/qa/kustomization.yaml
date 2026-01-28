@@ -38,25 +38,21 @@ patches:
       kind: StatefulSet
       metadata:
         name: redis
-  # Remove standard Deployments (using Rollouts instead)
+  # Scale down standard Deployments to 0 (Rollouts will handle traffic)
   - target:
       kind: Deployment
       name: vote
     patch: |-
-      $patch: delete
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: vote
+      - op: replace
+        path: /spec/replicas
+        value: 0
   - target:
       kind: Deployment
       name: result
     patch: |-
-      $patch: delete
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: result
+      - op: replace
+        path: /spec/replicas
+        value: 0
   # Additional patches from files
   - path: patch-rollout-replicas.yaml
   - path: patch-ingress.yaml
