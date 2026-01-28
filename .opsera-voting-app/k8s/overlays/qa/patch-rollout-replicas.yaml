@@ -1,71 +1,81 @@
-# QA environment replica counts for Argo Rollouts
-# Higher replicas for proper canary traffic distribution
+# QA - Testing newrelic canary analysis
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
   name: vote-rollout
 spec:
-  replicas: 4  # QA: Higher for better canary traffic distribution
+  replicas: 4
   strategy:
     canary:
-      # Canary traffic shifting: 10% -> 30% -> 60% -> 100%
+      analysis:
+        args:
+        - name: app-name
+          value: vote
+        - name: error-threshold
+          value: '5'
+        - name: latency-threshold
+          value: '500'
+        - name: apdex-threshold
+          value: '0.85'
+        startingStep: 1
+        templates:
+        - templateName: newrelic-combined-analysis
       steps:
       - setWeight: 10
-      - pause: {duration: 2m}
+      - pause:
+          duration: 1m
       - setWeight: 30
-      - pause: {duration: 2m}
+      - pause:
+          duration: 1m
       - setWeight: 60
-      - pause: {duration: 2m}
+      - pause:
+          duration: 1m
       - setWeight: 100
-      # Analysis template for automated rollback (HTTP-based, no Prometheus required)
-      analysis:
-        templates:
-        - templateName: http-health-check
-        startingStep: 1
-        args:
-        - name: service-name
-          value: vote
-        - name: namespace
-          value: voting-app-qa
-      # Traffic routing with NGINX Ingress
       trafficRouting:
         nginx:
-          stableIngress: voting-app
           annotationPrefix: nginx.ingress.kubernetes.io
+          stableIngress: voting-app
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
   name: result-rollout
 spec:
-  replicas: 3  # QA: Multiple replicas for canary
+  replicas: 3
   strategy:
     canary:
+      analysis:
+        args:
+        - name: app-name
+          value: result
+        - name: error-threshold
+          value: '5'
+        - name: latency-threshold
+          value: '500'
+        - name: apdex-threshold
+          value: '0.85'
+        startingStep: 1
+        templates:
+        - templateName: newrelic-combined-analysis
       steps:
       - setWeight: 10
-      - pause: {duration: 2m}
+      - pause:
+          duration: 1m
       - setWeight: 30
-      - pause: {duration: 2m}
+      - pause:
+          duration: 1m
       - setWeight: 60
-      - pause: {duration: 2m}
+      - pause:
+          duration: 1m
       - setWeight: 100
-      analysis:
-        templates:
-        - templateName: http-health-check
-        startingStep: 1
-        args:
-        - name: service-name
-          value: result
-        - name: namespace
-          value: voting-app-qa
       trafficRouting:
         nginx:
-          stableIngress: voting-app-result
           annotationPrefix: nginx.ingress.kubernetes.io
+          stableIngress: voting-app-result
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: worker
 spec:
-  replicas: 2  # QA: Multiple workers for queue processing
+  replicas: 2
