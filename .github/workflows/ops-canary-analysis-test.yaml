@@ -7,6 +7,9 @@ on:
         description: 'Analysis provider (newrelic, prometheus, http)'
         required: true
         default: 'newrelic'
+  push:
+    paths:
+      - '.github/canary-test-config.txt'
 
 permissions:
   contents: write
