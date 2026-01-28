@@ -1,0 +1,492 @@
+# Temporary workflow - Test canary analysis with different providers
+name: "tmp: Test Canary Analysis"
+
+on:
+  workflow_dispatch:
+    inputs:
+      analysis_provider:
+        description: 'Analysis provider to test'
+        required: true
+        type: choice
+        options:
+          - newrelic
+          - prometheus
+          - http
+      trigger_rollout:
+        description: 'Trigger a new rollout after switching'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  switch-analysis:
+    name: "🔄 Switch to ${{ inputs.analysis_provider }}"
+    runs-on: ubuntu-latest
+    outputs:
+      template_name: ${{ steps.switch.outputs.template_name }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Determine Template Name
+        id: switch
+        run: |
+          case "${{ inputs.analysis_provider }}" in
+            newrelic)
+              TEMPLATE="newrelic-combined-analysis"
+              ;;
+            prometheus)
+              TEMPLATE="success-rate"
+              ;;
+            http)
+              TEMPLATE="http-health-check"
+              ;;
+          esac
+          
+          echo "template_name=$TEMPLATE" >> $GITHUB_OUTPUT
+          echo "## 🎯 Analysis Template Selection" >> $GITHUB_STEP_SUMMARY
+          echo "Selected: **$TEMPLATE**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update QA Kustomization
+        run: |
+          KUSTOMIZE_FILE=".opsera-voting-app/k8s/overlays/qa/kustomization.yaml"
+          PATCH_FILE=".opsera-voting-app/k8s/overlays/qa/patch-rollout-replicas.yaml"
+          TEMPLATE="${{ steps.switch.outputs.template_name }}"
+          
+          echo "## 📝 Updating Configuration" >> $GITHUB_STEP_SUMMARY
+          
+          # Update the patch file with new analysis template
+          if [ "${{ inputs.analysis_provider }}" = "newrelic" ]; then
+            # For New Relic: remove the deletion patches and update rollout template
+            cat > "$PATCH_FILE" << 'EOFPATCH'
+          # QA environment replica counts for Argo Rollouts
+          # Higher replicas for proper canary traffic distribution
+          apiVersion: argoproj.io/v1alpha1
+          kind: Rollout
+          metadata:
+            name: vote-rollout
+          spec:
+            replicas: 4  # QA: Higher for better canary traffic distribution
+            strategy:
+              canary:
+                # Canary traffic shifting: 10% -> 30% -> 60% -> 100%
+                steps:
+                - setWeight: 10
+                - pause: {duration: 1m}
+                - setWeight: 30
+                - pause: {duration: 1m}
+                - setWeight: 60
+                - pause: {duration: 1m}
+                - setWeight: 100
+                # NEW RELIC Analysis for automated canary validation
+                analysis:
+                  templates:
+                  - templateName: newrelic-combined-analysis
+                  startingStep: 1
+                  args:
+                  - name: app-name
+                    value: vote
+                  - name: error-threshold
+                    value: "5"
+                  - name: latency-threshold
+                    value: "500"
+                  - name: apdex-threshold
+                    value: "0.85"
+                # Traffic routing with NGINX Ingress
+                trafficRouting:
+                  nginx:
+                    stableIngress: voting-app
+                    annotationPrefix: nginx.ingress.kubernetes.io
+          ---
+          apiVersion: argoproj.io/v1alpha1
+          kind: Rollout
+          metadata:
+            name: result-rollout
+          spec:
+            replicas: 3  # QA: Multiple replicas for canary
+            strategy:
+              canary:
+                steps:
+                - setWeight: 10
+                - pause: {duration: 1m}
+                - setWeight: 30
+                - pause: {duration: 1m}
+                - setWeight: 60
+                - pause: {duration: 1m}
+                - setWeight: 100
+                analysis:
+                  templates:
+                  - templateName: newrelic-combined-analysis
+                  startingStep: 1
+                  args:
+                  - name: app-name
+                    value: result
+                  - name: error-threshold
+                    value: "5"
+                  - name: latency-threshold
+                    value: "500"
+                  - name: apdex-threshold
+                    value: "0.85"
+                trafficRouting:
+                  nginx:
+                    stableIngress: voting-app-result
+                    annotationPrefix: nginx.ingress.kubernetes.io
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: worker
+          spec:
+            replicas: 2  # QA: Multiple workers for queue processing
+          EOFPATCH
+            
+            # Update kustomization to NOT delete newrelic templates
+            sed -i '/# Exclude NewRelic AnalysisTemplates/,/name: success-rate/d' "$KUSTOMIZE_FILE"
+            # Re-add only success-rate deletion (we want newrelic)
+            cat >> "$KUSTOMIZE_FILE" << 'EOF'
+  # Keep NewRelic templates, delete Prometheus success-rate template
+  - target:
+      kind: AnalysisTemplate
+      name: success-rate
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: success-rate
+EOF
+            
+            echo "✅ Configured for **New Relic** analysis" >> $GITHUB_STEP_SUMMARY
+            
+          elif [ "${{ inputs.analysis_provider }}" = "prometheus" ]; then
+            # For Prometheus: use success-rate template
+            cat > "$PATCH_FILE" << 'EOFPATCH'
+          # QA environment replica counts for Argo Rollouts
+          # Higher replicas for proper canary traffic distribution
+          apiVersion: argoproj.io/v1alpha1
+          kind: Rollout
+          metadata:
+            name: vote-rollout
+          spec:
+            replicas: 4  # QA: Higher for better canary traffic distribution
+            strategy:
+              canary:
+                # Canary traffic shifting: 10% -> 30% -> 60% -> 100%
+                steps:
+                - setWeight: 10
+                - pause: {duration: 1m}
+                - setWeight: 30
+                - pause: {duration: 1m}
+                - setWeight: 60
+                - pause: {duration: 1m}
+                - setWeight: 100
+                # PROMETHEUS Analysis for automated canary validation
+                analysis:
+                  templates:
+                  - templateName: success-rate
+                  startingStep: 1
+                  args:
+                  - name: service-name
+                    value: vote
+                  - name: ingress-name
+                    value: voting-app
+                # Traffic routing with NGINX Ingress
+                trafficRouting:
+                  nginx:
+                    stableIngress: voting-app
+                    annotationPrefix: nginx.ingress.kubernetes.io
+          ---
+          apiVersion: argoproj.io/v1alpha1
+          kind: Rollout
+          metadata:
+            name: result-rollout
+          spec:
+            replicas: 3  # QA: Multiple replicas for canary
+            strategy:
+              canary:
+                steps:
+                - setWeight: 10
+                - pause: {duration: 1m}
+                - setWeight: 30
+                - pause: {duration: 1m}
+                - setWeight: 60
+                - pause: {duration: 1m}
+                - setWeight: 100
+                analysis:
+                  templates:
+                  - templateName: success-rate
+                  startingStep: 1
+                  args:
+                  - name: service-name
+                    value: result
+                  - name: ingress-name
+                    value: voting-app-result
+                trafficRouting:
+                  nginx:
+                    stableIngress: voting-app-result
+                    annotationPrefix: nginx.ingress.kubernetes.io
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: worker
+          spec:
+            replicas: 2  # QA: Multiple workers for queue processing
+          EOFPATCH
+            
+            # Update kustomization to NOT delete success-rate but delete newrelic
+            sed -i '/# Exclude NewRelic AnalysisTemplates/,/name: success-rate/d' "$KUSTOMIZE_FILE"
+            # Re-add deletion for newrelic templates only
+            cat >> "$KUSTOMIZE_FILE" << 'EOF'
+  # Keep Prometheus success-rate, delete NewRelic templates
+  - target:
+      kind: AnalysisTemplate
+      name: newrelic-analysis
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: newrelic-analysis
+  - target:
+      kind: AnalysisTemplate
+      name: newrelic-nrql-analysis
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: newrelic-nrql-analysis
+  - target:
+      kind: AnalysisTemplate
+      name: newrelic-combined-analysis
+    patch: |-
+      $patch: delete
+      apiVersion: argoproj.io/v1alpha1
+      kind: AnalysisTemplate
+      metadata:
+        name: newrelic-combined-analysis
+EOF
+            
+            echo "✅ Configured for **Prometheus** analysis" >> $GITHUB_STEP_SUMMARY
+            
+          else
+            # HTTP: keep original with http-health-check
+            cat > "$PATCH_FILE" << 'EOFPATCH'
+          # QA environment replica counts for Argo Rollouts
+          # Higher replicas for proper canary traffic distribution
+          apiVersion: argoproj.io/v1alpha1
+          kind: Rollout
+          metadata:
+            name: vote-rollout
+          spec:
+            replicas: 4  # QA: Higher for better canary traffic distribution
+            strategy:
+              canary:
+                # Canary traffic shifting: 10% -> 30% -> 60% -> 100%
+                steps:
+                - setWeight: 10
+                - pause: {duration: 1m}
+                - setWeight: 30
+                - pause: {duration: 1m}
+                - setWeight: 60
+                - pause: {duration: 1m}
+                - setWeight: 100
+                # HTTP Analysis for automated canary validation (no external deps)
+                analysis:
+                  templates:
+                  - templateName: http-health-check
+                  startingStep: 1
+                  args:
+                  - name: service-name
+                    value: vote
+                  - name: namespace
+                    value: voting-app-qa
+                # Traffic routing with NGINX Ingress
+                trafficRouting:
+                  nginx:
+                    stableIngress: voting-app
+                    annotationPrefix: nginx.ingress.kubernetes.io
+          ---
+          apiVersion: argoproj.io/v1alpha1
+          kind: Rollout
+          metadata:
+            name: result-rollout
+          spec:
+            replicas: 3  # QA: Multiple replicas for canary
+            strategy:
+              canary:
+                steps:
+                - setWeight: 10
+                - pause: {duration: 1m}
+                - setWeight: 30
+                - pause: {duration: 1m}
+                - setWeight: 60
+                - pause: {duration: 1m}
+                - setWeight: 100
+                analysis:
+                  templates:
+                  - templateName: http-health-check
+                  startingStep: 1
+                  args:
+                  - name: service-name
+                    value: result
+                  - name: namespace
+                    value: voting-app-qa
+                trafficRouting:
+                  nginx:
+                    stableIngress: voting-app-result
+                    annotationPrefix: nginx.ingress.kubernetes.io
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: worker
+          spec:
+            replicas: 2  # QA: Multiple workers for queue processing
+          EOFPATCH
+            
+            echo "✅ Configured for **HTTP** analysis" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files Modified" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$PATCH_FILE\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "test(${{ inputs.analysis_provider }}): switch canary analysis to ${{ steps.switch.outputs.template_name }}"
+          git push origin main
+
+  trigger-rollout:
+    name: "🚀 Trigger Rollout"
+    runs-on: ubuntu-latest
+    needs: [switch-analysis]
+    if: inputs.trigger_rollout == true
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl & Argo Rollouts
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Sync ArgoCD & Restart Rollout
+        run: |
+          # Connect to hub cluster for ArgoCD
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "## 🔄 ArgoCD Sync" >> $GITHUB_STEP_SUMMARY
+          
+          # Hard refresh QA app
+          kubectl patch application voting-app-qa -n argocd \
+            --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}' || true
+          
+          sleep 5
+          
+          # Trigger sync
+          kubectl patch application voting-app-qa -n argocd \
+            --type merge -p '{"operation":{"initiatedBy":{"username":"github-actions"},"sync":{"prune":true}}}' || true
+          
+          echo "✅ ArgoCD sync triggered" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait for sync
+          sleep 30
+          
+          # Connect to spoke cluster for rollout restart
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Rollout Restart" >> $GITHUB_STEP_SUMMARY
+          
+          # Restart rollouts to trigger canary
+          kubectl-argo-rollouts restart vote-rollout -n voting-app-qa || true
+          kubectl-argo-rollouts restart result-rollout -n voting-app-qa || true
+          
+          echo "✅ Rollouts restarted" >> $GITHUB_STEP_SUMMARY
+
+  monitor-canary:
+    name: "📊 Monitor Canary"
+    runs-on: ubuntu-latest
+    needs: [switch-analysis, trigger-rollout]
+    if: inputs.trigger_rollout == true
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl & Argo Rollouts
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Monitor Rollout Progress
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "## 📊 Canary Analysis Monitoring" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Analysis Provider:** ${{ inputs.analysis_provider }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Template:** ${{ needs.switch-analysis.outputs.template_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Monitor for 5 minutes
+          for i in $(seq 1 10); do
+            echo "### Check $i/10 ($(date))" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Get rollout status
+            kubectl-argo-rollouts status vote-rollout -n voting-app-qa --timeout 10s 2>&1 | head -20 >> $GITHUB_STEP_SUMMARY || true
+            
+            # Get analysis runs
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Active Analysis Runs:**" >> $GITHUB_STEP_SUMMARY
+            kubectl get analysisruns -n voting-app-qa -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,AGE:.metadata.creationTimestamp' 2>/dev/null | tail -5 >> $GITHUB_STEP_SUMMARY || echo "None" >> $GITHUB_STEP_SUMMARY
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            sleep 30
+          done
+          
+          # Final status
+          echo "## 🏁 Final Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 >> $GITHUB_STEP_SUMMARY || true

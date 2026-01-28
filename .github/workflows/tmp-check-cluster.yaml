@@ -1,0 +1,98 @@
+# Temporary workflow - Check cluster state for canary analysis testing
+name: "tmp: Check Cluster State"
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check-cluster:
+    name: "🔍 Check Cluster State"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Check New Relic Secret
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "## 🔐 New Relic Secret Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if kubectl get secret newrelic-api-key -n voting-app-qa &>/dev/null; then
+            echo "✅ **newrelic-api-key** secret exists in voting-app-qa" >> $GITHUB_STEP_SUMMARY
+            kubectl get secret newrelic-api-key -n voting-app-qa -o jsonpath='{.data}' | jq -r 'keys[]' | while read key; do
+              echo "  - Key: \`$key\`" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "❌ **newrelic-api-key** secret NOT found in voting-app-qa" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Prometheus
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Prometheus Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          PROM_PODS=$(kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus -o name 2>/dev/null | wc -l)
+          
+          if [ "$PROM_PODS" -gt 0 ]; then
+            echo "✅ **Prometheus** is installed in monitoring namespace" >> $GITHUB_STEP_SUMMARY
+            kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus -o wide >> $GITHUB_STEP_SUMMARY || true
+            
+            # Test Prometheus connectivity
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Prometheus Connectivity Test" >> $GITHUB_STEP_SUMMARY
+            PROM_URL="http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"
+            echo "URL: \`$PROM_URL\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Prometheus** NOT found in monitoring namespace" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Current QA Rollout Status
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 QA Rollout Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for ROLLOUT in vote-rollout result-rollout; do
+            echo "### $ROLLOUT" >> $GITHUB_STEP_SUMMARY
+            STATUS=$(kubectl get rollout $ROLLOUT -n voting-app-qa -o jsonpath='{.status.phase}' 2>/dev/null || echo "Not Found")
+            REPLICAS=$(kubectl get rollout $ROLLOUT -n voting-app-qa -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "N/A")
+            ANALYSIS=$(kubectl get rollout $ROLLOUT -n voting-app-qa -o jsonpath='{.spec.strategy.canary.analysis.templates[0].templateName}' 2>/dev/null || echo "None")
+            
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | $STATUS |" >> $GITHUB_STEP_SUMMARY
+            echo "| Replicas | $REPLICAS |" >> $GITHUB_STEP_SUMMARY
+            echo "| Analysis Template | \`$ANALYSIS\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: List Available Analysis Templates
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Analysis Templates in QA" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          kubectl get analysistemplates -n voting-app-qa -o custom-columns='NAME:.metadata.name,AGE:.metadata.creationTimestamp' 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No analysis templates found" >> $GITHUB_STEP_SUMMARY
