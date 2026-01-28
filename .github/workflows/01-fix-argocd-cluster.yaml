@@ -214,13 +214,17 @@ jobs:
           # Create namespace and service account for ArgoCD
           kubectl create namespace argocd-manager 2>/dev/null || true
 
+          # Apply ServiceAccount
           cat <<EOF | kubectl apply -f -
           apiVersion: v1
           kind: ServiceAccount
           metadata:
             name: argocd-manager
             namespace: argocd-manager
-          ---
+          EOF
+
+          # Apply Secret for token
+          cat <<EOF | kubectl apply -f -
           apiVersion: v1
           kind: Secret
           metadata:
@@ -229,7 +233,11 @@ jobs:
             annotations:
               kubernetes.io/service-account.name: argocd-manager
           type: kubernetes.io/service-account-token
-          ---
+          EOF
+
+          # Delete and recreate ClusterRoleBinding (roleRef is immutable, cannot be changed via apply)
+          kubectl delete clusterrolebinding argocd-manager-role-binding 2>/dev/null || true
+          cat <<EOF | kubectl create -f -
           apiVersion: rbac.authorization.k8s.io/v1
           kind: ClusterRoleBinding
           metadata:
