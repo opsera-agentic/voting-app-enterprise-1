@@ -103,9 +103,5 @@ spec:
           capabilities:
             drop:
             - ALL
-  strategy:
-    canary:
-      analysis:
-        args:
-        - name: app-name
-          value: vote-qa
+  # Note: strategy.canary.analysis is configured in patch-rollout-replicas.yaml
+  # with correct service-name arg for http-health-check template
