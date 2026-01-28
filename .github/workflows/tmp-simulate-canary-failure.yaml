@@ -17,6 +17,9 @@ on:
         description: "Latency to inject (ms) - for latency type"
         required: false
         default: "2000"
+  push:
+    paths:
+      - ".github/simulate-failure-config.txt"
 
 permissions:
   contents: write
@@ -40,6 +43,22 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
+      - name: Get Failure Config
+        id: config
+        run: |
+          # Read from inputs or config file
+          if [ -n "${{ inputs.failure_type }}" ]; then
+            FAILURE_TYPE="${{ inputs.failure_type }}"
+            LATENCY_MS="${{ inputs.latency_ms || '2000' }}"
+          else
+            # Read from config file
+            FAILURE_TYPE=$(head -1 .github/simulate-failure-config.txt 2>/dev/null | awk '{print $1}' || echo "latency")
+            LATENCY_MS=$(head -1 .github/simulate-failure-config.txt 2>/dev/null | awk '{print $2}' || echo "2000")
+          fi
+          echo "failure_type=$FAILURE_TYPE" >> $GITHUB_OUTPUT
+          echo "latency_ms=$LATENCY_MS" >> $GITHUB_OUTPUT
+          echo "Failure type: $FAILURE_TYPE, Latency: ${LATENCY_MS}ms"
+
       - name: Backup Original Code
         id: backup
         run: |
@@ -49,9 +68,9 @@ jobs:
           echo "Original code hash: $HASH"
 
       - name: Inject Latency Failure
-        if: ${{ inputs.failure_type == 'latency' }}
+        if: ${{ steps.config.outputs.failure_type == 'latency' || inputs.failure_type == 'latency' }}
         run: |
-          LATENCY="${{ inputs.latency_ms }}"
+          LATENCY="${{ steps.config.outputs.latency_ms || inputs.latency_ms || '2000' }}"
           
           echo "## 💉 Injecting Latency Failure" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -142,7 +161,7 @@ PYEOF
           echo "ENV INJECTED_LATENCY_MS=$LATENCY" >> vote/Dockerfile
 
       - name: Inject Error Rate Failure
-        if: ${{ inputs.failure_type == 'error_rate' }}
+        if: ${{ steps.config.outputs.failure_type == 'error_rate' || inputs.failure_type == 'error_rate' }}
         run: |
           echo "## 💉 Injecting Error Rate Failure" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -219,7 +238,7 @@ PYEOF
           sed -i 's/🚀/💀/g' vote/templates/index.html
 
       - name: Inject Crash Failure
-        if: ${{ inputs.failure_type == 'crash' }}
+        if: ${{ steps.config.outputs.failure_type == 'crash' || inputs.failure_type == 'crash' }}
         run: |
           echo "## 💉 Injecting Crash Failure" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
