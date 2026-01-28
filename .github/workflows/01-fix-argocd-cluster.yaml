@@ -1,0 +1,596 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║     ██████╗ ██████╗ ███████╗███████╗██████╗  █████╗                           ║
+# ║    ██╔═══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗██╔══██╗                          ║
+# ║    ██║   ██║██████╔╝███████╗█████╗  ██████╔╝███████║                          ║
+# ║    ██║   ██║██╔═══╝ ╚════██║██╔══╝  ██╔══██╗██╔══██║                          ║
+# ║    ╚██████╔╝██║     ███████║███████╗██║  ██║██║  ██║                          ║
+# ║     ╚═════╝ ╚═╝     ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝                          ║
+# ║                                                                                ║
+# ║              FIX ARGOCD - CLUSTER REGISTRATION & APP CONFIG                    ║
+# ║                                                                                ║
+# ║  This workflow fixes critical ArgoCD issues:                                   ║
+# ║  • Registers spoke cluster in ArgoCD (MISSING!)                                ║
+# ║  • Updates ArgoCD applications with correct Git repo                           ║
+# ║  • Forces sync after fixes                                                     ║
+# ║                                                                                ║
+# ║  ROOT CAUSE: Cluster opsera-usw2-np was not registered in ArgoCD               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "🔧 Fix: ArgoCD Cluster & Apps"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - diagnose-only
+          - register-cluster
+          - fix-applications
+          - full-fix
+        default: 'full-fix'
+      force_recreate:
+        description: 'Force recreate cluster secret (if exists)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 1: DIAGNOSE CURRENT STATE
+  # ════════════════════════════════════════════════════════════════════════════════
+  diagnose:
+    name: "🔍 Diagnose ArgoCD Issues"
+    runs-on: ubuntu-latest
+    outputs:
+      cluster_registered: ${{ steps.check.outputs.cluster_registered }}
+      spoke_endpoint: ${{ steps.check.outputs.spoke_endpoint }}
+      dev_app_status: ${{ steps.check.outputs.dev_app_status }}
+      qa_app_status: ${{ steps.check.outputs.qa_app_status }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Diagnose ArgoCD State
+        id: check
+        run: |
+          echo "## 🔍 ArgoCD Diagnostic Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Connect to hub cluster
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          # Check registered clusters
+          echo "### 📋 Registered Clusters in ArgoCD" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            -o custom-columns=NAME:.metadata.name,CLUSTER:.data.name 2>/dev/null | \
+            while read name b64; do
+              [ "$name" != "NAME" ] && echo "$name: $(echo $b64 | base64 -d 2>/dev/null)"
+            done >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+          # Check if opsera-usw2-np is registered
+          CLUSTER_SECRET=$(kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            -o jsonpath='{.items[*].data.name}' 2>/dev/null | tr ' ' '\n' | \
+            while read b64; do echo $b64 | base64 -d 2>/dev/null; done | grep -x "${{ env.SPOKE_CLUSTER }}" || echo "")
+
+          if [ -n "$CLUSTER_SECRET" ]; then
+            echo "cluster_registered=true" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Cluster \`${{ env.SPOKE_CLUSTER }}\` IS registered**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "cluster_registered=false" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Cluster \`${{ env.SPOKE_CLUSTER }}\` is NOT registered - THIS IS THE ROOT CAUSE!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Get spoke cluster endpoint
+          SPOKE_ENDPOINT=$(aws eks describe-cluster --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }} \
+            --query 'cluster.endpoint' --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "spoke_endpoint=${SPOKE_ENDPOINT}" >> $GITHUB_OUTPUT
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Spoke Cluster Details" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster Name | \`${{ env.SPOKE_CLUSTER }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint | \`${SPOKE_ENDPOINT}\` |" >> $GITHUB_STEP_SUMMARY
+
+          # Check ArgoCD applications
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📱 ArgoCD Applications Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | Sync Status | Health | Error |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-------------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+
+          for APP in voting-app-dev voting-app-qa; do
+            STATUS=$(kubectl get application $APP -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "NotFound")
+            HEALTH=$(kubectl get application $APP -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo "NotFound")
+            ERROR=$(kubectl get application $APP -n argocd -o jsonpath='{.status.conditions[0].message}' 2>/dev/null | head -c 50 || echo "None")
+
+            echo "| \`${APP}\` | ${STATUS} | ${HEALTH} | ${ERROR}... |" >> $GITHUB_STEP_SUMMARY
+
+            if [ "$APP" = "voting-app-dev" ]; then
+              echo "dev_app_status=${STATUS}" >> $GITHUB_OUTPUT
+            else
+              echo "qa_app_status=${STATUS}" >> $GITHUB_OUTPUT
+            fi
+          done
+
+          # Show the actual error
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ❌ Detailed Error Messages" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get application voting-app-dev -n argocd -o jsonpath='{.status.conditions[*].message}' 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No error details"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          kubectl get application voting-app-qa -n argocd -o jsonpath='{.status.conditions[*].message}' 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No error details"
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 2: REGISTER CLUSTER IN ARGOCD
+  # ════════════════════════════════════════════════════════════════════════════════
+  register-cluster:
+    name: "🔗 Register Cluster in ArgoCD"
+    runs-on: ubuntu-latest
+    needs: [diagnose]
+    if: |
+      (github.event.inputs.action == 'register-cluster' || github.event.inputs.action == 'full-fix') &&
+      (needs.diagnose.outputs.cluster_registered == 'false' || github.event.inputs.force_recreate == 'true')
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          # kubectl
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+          # argocd CLI
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/
+
+      - name: Register Spoke Cluster in ArgoCD
+        run: |
+          echo "## 🔗 Cluster Registration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get spoke cluster details
+          SPOKE_ENDPOINT=$(aws eks describe-cluster --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }} \
+            --query 'cluster.endpoint' --output text)
+          SPOKE_CA=$(aws eks describe-cluster --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }} \
+            --query 'cluster.certificateAuthority.data' --output text)
+
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | \`${{ env.SPOKE_CLUSTER }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint | \`${SPOKE_ENDPOINT}\` |" >> $GITHUB_STEP_SUMMARY
+
+          # Connect to hub cluster (where ArgoCD runs)
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          # Delete existing secret if force_recreate
+          if [ "${{ github.event.inputs.force_recreate }}" = "true" ]; then
+            kubectl delete secret cluster-${{ env.SPOKE_CLUSTER }} -n argocd 2>/dev/null || true
+            echo "| Action | 🗑️ Deleted existing secret |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Create ServiceAccount token for ArgoCD to access spoke cluster
+          # First, connect to spoke cluster to create SA
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }} --alias spoke
+          kubectl config use-context spoke
+
+          # Create namespace and service account for ArgoCD
+          kubectl create namespace argocd-manager 2>/dev/null || true
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: argocd-manager
+            namespace: argocd-manager
+          ---
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: argocd-manager-token
+            namespace: argocd-manager
+            annotations:
+              kubernetes.io/service-account.name: argocd-manager
+          type: kubernetes.io/service-account-token
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: argocd-manager-role-binding
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+            - kind: ServiceAccount
+              name: argocd-manager
+              namespace: argocd-manager
+          EOF
+
+          # Wait for token to be generated
+          sleep 5
+
+          # Get the token
+          SA_TOKEN=$(kubectl get secret argocd-manager-token -n argocd-manager -o jsonpath='{.data.token}' | base64 -d)
+
+          # Switch back to hub cluster
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          # Create the cluster secret in ArgoCD
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cluster-${{ env.SPOKE_CLUSTER }}
+            namespace: argocd
+            labels:
+              argocd.argoproj.io/secret-type: cluster
+          type: Opaque
+          stringData:
+            name: "${{ env.SPOKE_CLUSTER }}"
+            server: "${SPOKE_ENDPOINT}"
+            config: |
+              {
+                "bearerToken": "${SA_TOKEN}",
+                "tlsClientConfig": {
+                  "insecure": false,
+                  "caData": "${SPOKE_CA}"
+                }
+              }
+          EOF
+
+          echo "| Registration | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+
+          # Verify registration
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Verification" >> $GITHUB_STEP_SUMMARY
+          echo "Registered clusters:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster -o custom-columns=NAME:.metadata.name --no-headers >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 3: FIX ARGOCD APPLICATIONS
+  # ════════════════════════════════════════════════════════════════════════════════
+  fix-applications:
+    name: "🔄 Fix ArgoCD Applications"
+    runs-on: ubuntu-latest
+    needs: [diagnose, register-cluster]
+    if: |
+      always() &&
+      (github.event.inputs.action == 'fix-applications' || github.event.inputs.action == 'full-fix') &&
+      (needs.register-cluster.result == 'success' || needs.register-cluster.result == 'skipped')
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Fix ArgoCD Applications
+        run: |
+          echo "## 🔄 ArgoCD Application Fix" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Connect to hub cluster
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}.git"
+
+          echo "| Application | Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          # Fix DEV application
+          echo "Fixing voting-app-dev..."
+          kubectl delete application voting-app-dev -n argocd 2>/dev/null || true
+          sleep 2
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: voting-app-dev
+            namespace: argocd
+            labels:
+              app.kubernetes.io/name: voting-app
+              app.kubernetes.io/part-of: voting-app
+              environment: dev
+            annotations:
+              notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments
+              notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments
+              notifications.argoproj.io/subscribe.on-health-degraded.slack: alerts
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: ${REPO_URL}
+              targetRevision: main
+              path: .opsera-voting-app/k8s/overlays/dev
+            destination:
+              name: ${{ env.SPOKE_CLUSTER }}
+              namespace: voting-app-dev
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+                allowEmpty: false
+              syncOptions:
+                - CreateNamespace=true
+                - PrunePropagationPolicy=foreground
+                - PruneLast=true
+                - ApplyOutOfSyncOnly=true
+              retry:
+                limit: 5
+                backoff:
+                  duration: 5s
+                  factor: 2
+                  maxDuration: 3m
+            ignoreDifferences:
+              - group: apps
+                kind: StatefulSet
+                jsonPointers:
+                  - /spec/volumeClaimTemplates/0/apiVersion
+                  - /spec/volumeClaimTemplates/0/kind
+          EOF
+
+          echo "| \`voting-app-dev\` | Recreated | ✅ |" >> $GITHUB_STEP_SUMMARY
+
+          # Fix QA application
+          echo "Fixing voting-app-qa..."
+          kubectl delete application voting-app-qa -n argocd 2>/dev/null || true
+          sleep 2
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: voting-app-qa
+            namespace: argocd
+            labels:
+              app.kubernetes.io/name: voting-app
+              app.kubernetes.io/part-of: voting-app
+              deployment-strategy: canary
+              environment: qa
+            annotations:
+              notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments
+              notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments
+              notifications.argoproj.io/subscribe.on-health-degraded.slack: alerts
+              notifications.argoproj.io/subscribe.on-rollout-step-completed.slack: deployments
+              notifications.argoproj.io/subscribe.on-rollout-aborted.slack: alerts
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: ${REPO_URL}
+              targetRevision: main
+              path: .opsera-voting-app/k8s/overlays/qa
+            destination:
+              name: ${{ env.SPOKE_CLUSTER }}
+              namespace: voting-app-qa
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+                allowEmpty: false
+              syncOptions:
+                - CreateNamespace=true
+                - PrunePropagationPolicy=foreground
+                - PruneLast=true
+                - ApplyOutOfSyncOnly=true
+                - RespectIgnoreDifferences=true
+              retry:
+                limit: 5
+                backoff:
+                  duration: 5s
+                  factor: 2
+                  maxDuration: 3m
+            ignoreDifferences:
+              - group: argoproj.io
+                kind: Rollout
+                jsonPointers:
+                  - /spec/replicas
+                  - /status
+              - group: apps
+                kind: StatefulSet
+                jsonPointers:
+                  - /spec/volumeClaimTemplates/0/apiVersion
+                  - /spec/volumeClaimTemplates/0/kind
+          EOF
+
+          echo "| \`voting-app-qa\` | Recreated | ✅ |" >> $GITHUB_STEP_SUMMARY
+
+          # Wait for sync
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⏳ Waiting for Initial Sync..." >> $GITHUB_STEP_SUMMARY
+          sleep 10
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # STAGE 4: VERIFY FIX
+  # ════════════════════════════════════════════════════════════════════════════════
+  verify:
+    name: "✅ Verify Fix"
+    runs-on: ubuntu-latest
+    needs: [fix-applications]
+    if: always() && (github.event.inputs.action != 'diagnose-only')
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Verify ArgoCD State
+        run: |
+          echo "## ✅ Post-Fix Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Connect to hub cluster
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          # Check clusters
+          echo "### 📋 Registered Clusters" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            -o custom-columns=NAME:.metadata.name,CLUSTER:.data.name 2>/dev/null | \
+            while read name b64; do
+              [ "$name" != "NAME" ] && echo "$name: $(echo $b64 | base64 -d 2>/dev/null)"
+            done >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+          # Wait a bit for apps to start syncing
+          sleep 15
+
+          # Check application status
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📱 Application Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | Sync Status | Health | Repo |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-------------|--------|------|" >> $GITHUB_STEP_SUMMARY
+
+          ALL_HEALTHY=true
+          for APP in voting-app-dev voting-app-qa; do
+            STATUS=$(kubectl get application $APP -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+            HEALTH=$(kubectl get application $APP -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+            REPO=$(kubectl get application $APP -n argocd -o jsonpath='{.spec.source.repoURL}' 2>/dev/null || echo "Unknown")
+
+            # Shorten repo URL for display
+            REPO_SHORT=$(echo "$REPO" | sed 's|https://github.com/||' | sed 's|.git||')
+
+            if [ "$STATUS" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo "| \`${APP}\` | ✅ ${STATUS} | ✅ ${HEALTH} | ${REPO_SHORT} |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| \`${APP}\` | ⏳ ${STATUS} | ⏳ ${HEALTH} | ${REPO_SHORT} |" >> $GITHUB_STEP_SUMMARY
+              ALL_HEALTHY=false
+            fi
+          done
+
+          # Check pods in spoke cluster
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🐳 Pod Status" >> $GITHUB_STEP_SUMMARY
+
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          for NS in voting-app-dev voting-app-qa; do
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**${NS}:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            kubectl get pods -n $NS --no-headers 2>/dev/null | head -10 >> $GITHUB_STEP_SUMMARY || echo "No pods found"
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          done
+
+          # Final status
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          if [ "$ALL_HEALTHY" = "true" ]; then
+            echo "## 🎉 Fix Successful!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⏳ Sync in Progress" >> $GITHUB_STEP_SUMMARY
+            echo "Applications are syncing. Check ArgoCD UI or run **🔧 Ops: Sync ArgoCD** workflow." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Wait for applications to sync (may take 2-5 minutes)" >> $GITHUB_STEP_SUMMARY
+          echo "2. Run **🚀 CD: Deploy to DEV** to deploy latest images" >> $GITHUB_STEP_SUMMARY
+          echo "3. Verify endpoints: https://opsera-voting-app-dev.agent.opsera.dev" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send Slack Notification
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "Slack webhook not configured"
+            exit 0
+          fi
+
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && EMOJI="✅" && COLOR="good" || EMOJI="⚠️" && COLOR="warning"
+
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "attachments": [{
+                "color": "'"${COLOR}"'",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "'"${EMOJI}"' ArgoCD Fix Complete", "emoji": true}
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {"type": "mrkdwn", "text": "*Action:* `'"${{ github.event.inputs.action }}"'`"},
+                      {"type": "mrkdwn", "text": "*Status:* '"${STATUS}"'"}
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "Cluster `'"${{ env.SPOKE_CLUSTER }}"'` registered and applications recreated."}
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {"type": "mrkdwn", "text": "Triggered by *${{ github.actor }}* | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"}
+                    ]
+                  }
+                ]
+              }]
+            }' \
+            "$SLACK_WEBHOOK" || true
