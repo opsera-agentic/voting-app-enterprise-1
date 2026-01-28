@@ -14,7 +14,6 @@ env:
   AWS_REGION: us-west-2
   HUB_CLUSTER: argocd-usw2
   SPOKE_CLUSTER: opsera-usw2-np
-  LATENCY_MS: "2000"
 
 jobs:
   inject-and-deploy:
@@ -34,75 +33,75 @@ jobs:
           echo "## 💉 Injecting 2 Second Latency" >> $GITHUB_STEP_SUMMARY
           echo "This will cause the canary to fail and rollback." >> $GITHUB_STEP_SUMMARY
           
-          cat > vote/app.py << 'PYEOF'
-from flask import Flask, render_template, request, make_response, g
-from redis import Redis
-import os
-import socket
-import random
-import json
-import logging
-import time
+          # Use Python to generate the file to avoid heredoc issues
+          python3 << 'EOF'
+          code = '''from flask import Flask, render_template, request, make_response, g
+          from redis import Redis
+          import os
+          import socket
+          import random
+          import json
+          import logging
+          import time
 
-# ===== INJECTED LATENCY FOR CANARY FAILURE DEMO =====
-LATENCY_SECONDS = 2.0
-# ====================================================
+          LATENCY_SECONDS = 2.0
 
-option_a = os.getenv('OPTION_A', "Cats")
-option_b = os.getenv('OPTION_B', "Dogs")
-hostname = socket.gethostname()
+          option_a = os.getenv('OPTION_A', "Cats")
+          option_b = os.getenv('OPTION_B', "Dogs")
+          hostname = socket.gethostname()
 
-app = Flask(__name__)
+          app = Flask(__name__)
 
-gunicorn_error_logger = logging.getLogger('gunicorn.error')
-app.logger.handlers.extend(gunicorn_error_logger.handlers)
-app.logger.setLevel(logging.INFO)
+          gunicorn_error_logger = logging.getLogger('gunicorn.error')
+          app.logger.handlers.extend(gunicorn_error_logger.handlers)
+          app.logger.setLevel(logging.INFO)
 
-def get_redis():
-    if not hasattr(g, 'redis'):
-        g.redis = Redis(host="redis", db=0, socket_timeout=5)
-    return g.redis
+          def get_redis():
+              if not hasattr(g, 'redis'):
+                  g.redis = Redis(host="redis", db=0, socket_timeout=5)
+              return g.redis
 
-@app.route("/", methods=['POST','GET'])
-def hello():
-    # ===== INJECTED LATENCY =====
-    app.logger.warning(f"💀 INJECTED LATENCY: Sleeping for {LATENCY_SECONDS}s")
-    time.sleep(LATENCY_SECONDS)
-    # ============================
-    
-    voter_id = request.cookies.get('voter_id')
-    if not voter_id:
-        voter_id = hex(random.getrandbits(64))[2:-1]
+          @app.route("/", methods=['POST','GET'])
+          def hello():
+              app.logger.warning(f"INJECTED LATENCY: Sleeping for {LATENCY_SECONDS}s")
+              time.sleep(LATENCY_SECONDS)
+              
+              voter_id = request.cookies.get('voter_id')
+              if not voter_id:
+                  voter_id = hex(random.getrandbits(64))[2:-1]
 
-    vote = None
+              vote = None
 
-    if request.method == 'POST':
-        redis = get_redis()
-        vote = request.form['vote']
-        app.logger.info('Received vote for %s', vote)
-        data = json.dumps({'voter_id': voter_id, 'vote': vote})
-        redis.rpush('votes', data)
+              if request.method == 'POST':
+                  redis = get_redis()
+                  vote = request.form['vote']
+                  app.logger.info('Received vote for %s', vote)
+                  data = json.dumps({'voter_id': voter_id, 'vote': vote})
+                  redis.rpush('votes', data)
 
-    resp = make_response(render_template(
-        'index.html',
-        option_a=option_a,
-        option_b=option_b,
-        hostname=hostname,
-        vote=vote,
-    ))
-    resp.set_cookie('voter_id', voter_id)
-    return resp
+              resp = make_response(render_template(
+                  'index.html',
+                  option_a=option_a,
+                  option_b=option_b,
+                  hostname=hostname,
+                  vote=vote,
+              ))
+              resp.set_cookie('voter_id', voter_id)
+              return resp
 
-@app.route("/health")
-def health():
-    time.sleep(1.0)  # Health check also slow
-    return "OK"
+          @app.route("/health")
+          def health():
+              time.sleep(1.0)
+              return "OK"
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
-PYEOF
-
-          # Mark as bad version
+          if __name__ == "__main__":
+              app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+          '''
+          import textwrap
+          with open('vote/app.py', 'w') as f:
+              f.write(textwrap.dedent(code))
+          EOF
+          
           sed -i 's/Version: v[0-9]*/Version: v99-SLOW/g' vote/templates/index.html 2>/dev/null || true
           
       - name: Configure AWS
@@ -125,41 +124,30 @@ PYEOF
           docker build -t 792373136340.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/vote:$TAG .
           docker push 792373136340.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/vote:$TAG
           
-          echo "## 🏷️ Built bad image: \`$TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "## Built bad image: $TAG" >> $GITHUB_STEP_SUMMARY
 
-      - name: Update QA Kustomization
+      - name: Update QA & Sync
         run: |
           BAD_TAG="${{ steps.build.outputs.tag }}"
-          
-          # Update vote image only
           sed -i "s|newTag: .*|newTag: $BAD_TAG|g" .opsera-voting-app/k8s/overlays/qa/kustomization.yaml
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "💀 Deploy slow canary: $BAD_TAG"
+          git commit -m "Deploy slow canary: $BAD_TAG"
           git push
-
-      - name: Sync ArgoCD & Restart Rollout
-        run: |
-          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
           
-          kubectl patch application voting-app-qa -n argocd \
-            --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          kubectl patch application voting-app-qa -n argocd --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
           sleep 10
           
           aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
-          
           curl -sLO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
           chmod +x kubectl-argo-rollouts-linux-amd64
-          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
-          
-          kubectl-argo-rollouts restart vote-rollout -n voting-app-qa || true
-          
-          echo "## 🚀 Deployed and restarted rollout" >> $GITHUB_STEP_SUMMARY
+          ./kubectl-argo-rollouts-linux-amd64 restart vote-rollout -n voting-app-qa || true
 
   watch-rollback:
-    name: "👀 Watch Canary Fail & Rollback"
+    name: "👀 Watch Rollback"
     needs: inject-and-deploy
     runs-on: ubuntu-latest
     
@@ -171,7 +159,7 @@ PYEOF
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install Tools
+      - name: Watch Canary
         run: |
           curl -sLO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/
@@ -179,172 +167,109 @@ PYEOF
           chmod +x kubectl-argo-rollouts-linux-amd64
           sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
           aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
-
-      - name: Watch Canary Progress
-        run: |
-          echo "# 🎯 Canary Failure & Rollback Demo" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Bad Image:** \`${{ needs.inject-and-deploy.outputs.bad_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Injected Latency:** 2000ms" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
           
-          PREV_PHASE=""
-          ROLLBACK_DETECTED=false
+          echo "# Canary Failure Demo" >> $GITHUB_STEP_SUMMARY
+          echo "Bad Image: ${{ needs.inject-and-deploy.outputs.bad_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          for i in $(seq 1 40); do
+          ROLLBACK=false
+          for i in $(seq 1 30); do
             PHASE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-            WEIGHT=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.canary.weight}' 2>/dev/null || echo "0")
-            TIME=$(date -u '+%H:%M:%S')
+            echo "Check $i: $PHASE" >> $GITHUB_STEP_SUMMARY
             
-            if [ "$PHASE" != "$PREV_PHASE" ]; then
-              case "$PHASE" in
-                Healthy)
-                  if [ "$ROLLBACK_DETECTED" = true ]; then
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo "### ✅ $TIME - ROLLBACK COMPLETE!" >> $GITHUB_STEP_SUMMARY
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo "Traffic restored to stable version." >> $GITHUB_STEP_SUMMARY
-                  else
-                    echo "### ✅ $TIME - Healthy" >> $GITHUB_STEP_SUMMARY
-                  fi
-                  ;;
-                Progressing)
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "### 🔄 $TIME - Canary Progressing (${WEIGHT}%)" >> $GITHUB_STEP_SUMMARY
-                  ;;
-                Degraded)
-                  ROLLBACK_DETECTED=true
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "### ❌ $TIME - CANARY FAILED!" >> $GITHUB_STEP_SUMMARY
-                  echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "**Analysis detected latency issue - triggering rollback!**" >> $GITHUB_STEP_SUMMARY
-                  
-                  # Get analysis details
-                  LATEST_AR=$(kubectl get analysisruns -n voting-app-qa --sort-by='.metadata.creationTimestamp' -o name 2>/dev/null | tail -1)
-                  if [ -n "$LATEST_AR" ]; then
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo "<details><summary>📊 Analysis Details</summary>" >> $GITHUB_STEP_SUMMARY
-                    echo "" >> $GITHUB_STEP_SUMMARY
-                    echo '```' >> $GITHUB_STEP_SUMMARY
-                    kubectl get $LATEST_AR -n voting-app-qa -o yaml 2>&1 | grep -A 50 "metricResults:" || echo "No details"
-                    echo '```' >> $GITHUB_STEP_SUMMARY
-                    echo "</details>" >> $GITHUB_STEP_SUMMARY
-                  fi
-                  ;;
-                *)
-                  echo "### ⏳ $TIME - $PHASE" >> $GITHUB_STEP_SUMMARY
-                  ;;
-              esac
-              PREV_PHASE="$PHASE"
+            if [ "$PHASE" = "Degraded" ]; then
+              echo "CANARY FAILED - Rollback triggered!" >> $GITHUB_STEP_SUMMARY
+              ROLLBACK=true
             fi
             
-            # Exit when rollback completes
-            if [ "$PHASE" = "Healthy" ] && [ "$ROLLBACK_DETECTED" = true ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "---" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "## 🎉 Demo Complete!" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**What happened:**" >> $GITHUB_STEP_SUMMARY
-              echo "1. 💉 Deployed canary with 2s latency" >> $GITHUB_STEP_SUMMARY
-              echo "2. 📊 Analysis detected slow response" >> $GITHUB_STEP_SUMMARY
-              echo "3. ❌ Canary marked as failed" >> $GITHUB_STEP_SUMMARY
-              echo "4. 🔄 Automatic rollback triggered" >> $GITHUB_STEP_SUMMARY
-              echo "5. ✅ Stable version restored" >> $GITHUB_STEP_SUMMARY
+            if [ "$PHASE" = "Healthy" ] && [ "$ROLLBACK" = true ]; then
+              echo "ROLLBACK COMPLETE!" >> $GITHUB_STEP_SUMMARY
               break
             fi
-            
-            sleep 15
+            sleep 20
           done
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 📋 Final Status" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 || true
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 >> $GITHUB_STEP_SUMMARY || true
 
   restore:
-    name: "🔧 Restore Good Code"
+    name: "🔧 Restore"
     needs: watch-rollback
     if: always()
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           ref: main
           
-      - name: Pull & Restore
-        run: |
+      - run: |
           git pull origin main
+          python3 << 'EOF'
+          code = '''from flask import Flask, render_template, request, make_response, g
+          from redis import Redis
+          import os
+          import socket
+          import random
+          import json
+          import logging
+
+          option_a = os.getenv('OPTION_A', "Cats")
+          option_b = os.getenv('OPTION_B', "Dogs")
+          hostname = socket.gethostname()
+
+          app = Flask(__name__)
+
+          gunicorn_error_logger = logging.getLogger('gunicorn.error')
+          app.logger.handlers.extend(gunicorn_error_logger.handlers)
+          app.logger.setLevel(logging.INFO)
+
+          def get_redis():
+              if not hasattr(g, 'redis'):
+                  g.redis = Redis(host="redis", db=0, socket_timeout=5)
+              return g.redis
+
+          @app.route("/", methods=['POST','GET'])
+          def hello():
+              voter_id = request.cookies.get('voter_id')
+              if not voter_id:
+                  voter_id = hex(random.getrandbits(64))[2:-1]
+
+              vote = None
+
+              if request.method == 'POST':
+                  redis = get_redis()
+                  vote = request.form['vote']
+                  app.logger.info('Received vote for %s', vote)
+                  data = json.dumps({'voter_id': voter_id, 'vote': vote})
+                  redis.rpush('votes', data)
+
+              resp = make_response(render_template(
+                  'index.html',
+                  option_a=option_a,
+                  option_b=option_b,
+                  hostname=hostname,
+                  vote=vote,
+              ))
+              resp.set_cookie('voter_id', voter_id)
+              return resp
+
+          @app.route("/health")
+          def health():
+              return "OK"
+
+          if __name__ == "__main__":
+              app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+          '''
+          import textwrap
+          with open('vote/app.py', 'w') as f:
+              f.write(textwrap.dedent(code))
+          EOF
           
-          # Restore original vote app
-          cat > vote/app.py << 'PYEOF'
-from flask import Flask, render_template, request, make_response, g
-from redis import Redis
-import os
-import socket
-import random
-import json
-import logging
-
-option_a = os.getenv('OPTION_A', "Cats")
-option_b = os.getenv('OPTION_B', "Dogs")
-hostname = socket.gethostname()
-
-app = Flask(__name__)
-
-gunicorn_error_logger = logging.getLogger('gunicorn.error')
-app.logger.handlers.extend(gunicorn_error_logger.handlers)
-app.logger.setLevel(logging.INFO)
-
-def get_redis():
-    if not hasattr(g, 'redis'):
-        g.redis = Redis(host="redis", db=0, socket_timeout=5)
-    return g.redis
-
-@app.route("/", methods=['POST','GET'])
-def hello():
-    voter_id = request.cookies.get('voter_id')
-    if not voter_id:
-        voter_id = hex(random.getrandbits(64))[2:-1]
-
-    vote = None
-
-    if request.method == 'POST':
-        redis = get_redis()
-        vote = request.form['vote']
-        app.logger.info('Received vote for %s', vote)
-        data = json.dumps({'voter_id': voter_id, 'vote': vote})
-        redis.rpush('votes', data)
-
-    resp = make_response(render_template(
-        'index.html',
-        option_a=option_a,
-        option_b=option_b,
-        hostname=hostname,
-        vote=vote,
-    ))
-    resp.set_cookie('voter_id', voter_id)
-    return resp
-
-@app.route("/health")
-def health():
-    return "OK"
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
-PYEOF
-
-          sed -i 's/Version: v99-SLOW/Version: v14 (Restored)/g' vote/templates/index.html 2>/dev/null || true
-          
+          sed -i 's/Version: v99-SLOW/Version: v14/g' vote/templates/index.html 2>/dev/null || true
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git diff --staged --quiet || git commit -m "🔧 Restore after latency simulation"
+          git diff --staged --quiet || git commit -m "Restore after simulation"
           git push || true
-          
-          echo "## ✅ Code restored" >> $GITHUB_STEP_SUMMARY
