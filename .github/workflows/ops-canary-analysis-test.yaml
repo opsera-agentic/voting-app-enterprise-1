@@ -51,7 +51,8 @@ jobs:
           PROVIDER="${{ steps.provider.outputs.value }}"
           case "$PROVIDER" in
             newrelic)
-              echo "name=newrelic-combined-analysis" >> $GITHUB_OUTPUT
+              # Use Job-based template that properly handles secrets
+              echo "name=newrelic-job-analysis" >> $GITHUB_OUTPUT
               ;;
             prometheus)
               echo "name=success-rate" >> $GITHUB_OUTPUT
@@ -78,17 +79,20 @@ jobs:
           template = "$TEMPLATE"
           
           if provider == "newrelic":
+              # Job-based template with proper secret handling
               vote_args = [
                   {"name": "app-name", "value": "vote"},
                   {"name": "error-threshold", "value": "5"},
                   {"name": "latency-threshold", "value": "500"},
-                  {"name": "apdex-threshold", "value": "0.85"}
+                  {"name": "apdex-threshold", "value": "0.85"},
+                  {"name": "nr-api-url", "value": "https://opsera-nrmock-labs.agent.opsera.dev"}
               ]
               result_args = [
                   {"name": "app-name", "value": "result"},
                   {"name": "error-threshold", "value": "5"},
                   {"name": "latency-threshold", "value": "500"},
-                  {"name": "apdex-threshold", "value": "0.85"}
+                  {"name": "apdex-threshold", "value": "0.85"},
+                  {"name": "nr-api-url", "value": "https://opsera-nrmock-labs.agent.opsera.dev"}
               ]
           elif provider == "prometheus":
               vote_args = [
