@@ -1,0 +1,223 @@
+# Blue-Green Rollout Operations
+# Manual actions for testing and promoting blue-green deployments
+
+name: "🔵🟢 Ops: Blue-Green Actions"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - status
+          - test-preview
+          - promote
+          - abort
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        default: staging
+        options:
+          - staging
+
+env:
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bluegreen-action:
+    name: "🔵🟢 ${{ github.event.inputs.action }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STATUS - Show current blue-green state
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Show Blue-Green Status
+        if: github.event.inputs.action == 'status'
+        run: |
+          NS="voting-app-${{ github.event.inputs.environment }}"
+
+          echo "### 🔵🟢 Blue-Green Status - ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get rollout info
+          PHASE=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.phase}')
+          ACTIVE_RS=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.blueGreen.activeSelector}')
+          PREVIEW_RS=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.blueGreen.previewSelector}')
+
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Phase** | \`$PHASE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Active RS** | \`$ACTIVE_RS\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Preview RS** | \`$PREVIEW_RS\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Show ReplicaSets
+          echo "### ReplicaSets" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get rs -n $NS -l app=vote --no-headers | while read line; do
+            echo "$line" >> $GITHUB_STEP_SUMMARY
+          done
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Show pods
+          echo "### Pods" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n $NS -l app=vote --no-headers | while read line; do
+            echo "$line" >> $GITHUB_STEP_SUMMARY
+          done
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          if [ "$PHASE" = "Paused" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⏸️ **Rollout is PAUSED** - Waiting for manual promotion" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Next steps:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Run \`test-preview\` action to verify new version" >> $GITHUB_STEP_SUMMARY
+            echo "2. Run \`promote\` action to switch traffic" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ═══════════════════════════════════════════════════════════════════
+      # TEST-PREVIEW - Test the preview service (new version)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Test Preview Service
+        if: github.event.inputs.action == 'test-preview'
+        run: |
+          NS="voting-app-${{ github.event.inputs.environment }}"
+
+          echo "### 🧪 Testing Preview Service" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get preview pod
+          PREVIEW_POD=$(kubectl get pods -n $NS -l app=vote -o jsonpath='{.items[0].metadata.name}' --field-selector=status.phase=Running | head -1)
+
+          # Test via kubectl exec to preview service
+          echo "Testing preview service internally..." >> $GITHUB_STEP_SUMMARY
+
+          PREVIEW_RESPONSE=$(kubectl exec -n $NS $PREVIEW_POD -- curl -s http://vote-preview.${NS}.svc.cluster.local/ 2>/dev/null || echo "Failed to connect")
+          PREVIEW_VERSION=$(echo "$PREVIEW_RESPONSE" | grep -o 'Version:[^<]*' || echo "Unknown")
+
+          ACTIVE_RESPONSE=$(kubectl exec -n $NS $PREVIEW_POD -- curl -s http://vote.${NS}.svc.cluster.local/ 2>/dev/null || echo "Failed to connect")
+          ACTIVE_VERSION=$(echo "$ACTIVE_RESPONSE" | grep -o 'Version:[^<]*' || echo "Unknown")
+
+          echo "| Service | Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Active (Production)** | $ACTIVE_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Preview (New)** | $PREVIEW_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # External URL test
+          echo "### External URL Test" >> $GITHUB_STEP_SUMMARY
+          PROD_URL="https://opsera-voting-app-${{ github.event.inputs.environment }}.agent.opsera.dev"
+          PROD_STATUS=$(curl -sSL -o /dev/null -w "%{http_code}" "$PROD_URL" 2>/dev/null || echo "000")
+          PROD_VER=$(curl -s "$PROD_URL" 2>/dev/null | grep -o 'Version:[^<]*' || echo "Unknown")
+
+          echo "| URL | Status | Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Production | $PROD_STATUS | $PROD_VER |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$PREVIEW_VERSION" != "$ACTIVE_VERSION" ]; then
+            echo "✅ **Preview has different version than Active** - Ready to promote!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Preview and Active have same version**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ═══════════════════════════════════════════════════════════════════
+      # PROMOTE - Switch traffic from active to preview (instant!)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Promote Blue-Green
+        if: github.event.inputs.action == 'promote'
+        run: |
+          NS="voting-app-${{ github.event.inputs.environment }}"
+
+          echo "### 🚀 Promoting Blue-Green Rollout" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get current state before promotion
+          BEFORE_ACTIVE=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.blueGreen.activeSelector}')
+          BEFORE_PREVIEW=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.blueGreen.previewSelector}')
+
+          echo "**Before Promotion:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Active: \`$BEFORE_ACTIVE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Preview: \`$BEFORE_PREVIEW\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Promote the rollout
+          echo "Promoting rollout..."
+          kubectl patch rollout vote-rollout -n $NS \
+            --type merge \
+            -p '{"status":{"promoteFull":true}}'
+
+          # Wait for promotion to complete
+          echo "Waiting for promotion to complete..."
+          sleep 10
+
+          # Get state after promotion
+          AFTER_ACTIVE=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.blueGreen.activeSelector}')
+          AFTER_PHASE=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.phase}')
+
+          echo "**After Promotion:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Active: \`$AFTER_ACTIVE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase: \`$AFTER_PHASE\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Verify traffic switch
+          PROD_URL="https://opsera-voting-app-${{ github.event.inputs.environment }}.agent.opsera.dev"
+          NEW_VERSION=$(curl -s "$PROD_URL" 2>/dev/null | grep -o 'Version:[^<]*' || echo "Unknown")
+
+          echo "### ✅ Traffic Switched!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Production URL now serving: **$NEW_VERSION**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View Staging]($PROD_URL)" >> $GITHUB_STEP_SUMMARY
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ABORT - Abort the rollout and keep active version
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Abort Rollout
+        if: github.event.inputs.action == 'abort'
+        run: |
+          NS="voting-app-${{ github.event.inputs.environment }}"
+
+          echo "### ❌ Aborting Blue-Green Rollout" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Abort the rollout
+          kubectl patch rollout vote-rollout -n $NS \
+            --type merge \
+            -p '{"status":{"abort":true}}'
+
+          sleep 5
+
+          PHASE=$(kubectl get rollout vote-rollout -n $NS -o jsonpath='{.status.phase}')
+
+          echo "Rollout aborted. Phase: \`$PHASE\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ Preview pods will be scaled down. Active version remains in production." >> $GITHUB_STEP_SUMMARY
