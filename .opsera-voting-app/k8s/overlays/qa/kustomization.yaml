@@ -99,11 +99,11 @@ labels:
 images:
   - name: vote
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/vote
-    newTag: 5c800c2-20260128035230
+    newTag: bad-slow-20260128035820
   - name: result
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/result
-    newTag: 5c800c2-20260128035230
+    newTag: bad-slow-20260128035820
   - name: worker
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/worker
-    newTag: 5c800c2-20260128035230
-    newTag: 5c800c2-20260128035230
+    newTag: bad-slow-20260128035820
+    newTag: bad-slow-20260128035820

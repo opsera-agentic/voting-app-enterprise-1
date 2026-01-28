@@ -5,19 +5,15 @@ import socket
 import random
 import json
 import logging
+import time
 
-# New Relic APM Integration
-# Initialize before Flask app for full instrumentation
-import newrelic.agent
-newrelic.agent.initialize()
+LATENCY_SECONDS = 2.0
 
 option_a = os.getenv('OPTION_A', "Cats")
 option_b = os.getenv('OPTION_B', "Dogs")
 hostname = socket.gethostname()
 
 app = Flask(__name__)
-# Wrap Flask app with New Relic
-app = newrelic.agent.WSGIApplicationWrapper(app)
 
 gunicorn_error_logger = logging.getLogger('gunicorn.error')
 app.logger.handlers.extend(gunicorn_error_logger.handlers)
@@ -30,6 +26,9 @@ def get_redis():
 
 @app.route("/", methods=['POST','GET'])
 def hello():
+    app.logger.warning(f"INJECTED LATENCY: Sleeping for {LATENCY_SECONDS}s")
+    time.sleep(LATENCY_SECONDS)
+
     voter_id = request.cookies.get('voter_id')
     if not voter_id:
         voter_id = hex(random.getrandbits(64))[2:-1]
@@ -53,6 +52,10 @@ def hello():
     resp.set_cookie('voter_id', voter_id)
     return resp
 
+@app.route("/health")
+def health():
+    time.sleep(1.0)
+    return "OK"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
