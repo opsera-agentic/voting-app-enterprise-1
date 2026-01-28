@@ -1,0 +1,108 @@
+name: "tmp: Debug Analysis"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+jobs:
+  debug:
+    name: "Debug Analysis Runs"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -sLO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl -sLO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Get Rollout Status
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "## Rollout Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 >> $GITHUB_STEP_SUMMARY || echo "Not found" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Get Analysis Runs
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Analysis Runs" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get analysisruns -n voting-app-qa -o wide 2>&1 >> $GITHUB_STEP_SUMMARY || echo "None" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Get Latest Analysis Run Details
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Latest Analysis Run YAML" >> $GITHUB_STEP_SUMMARY
+          
+          LATEST=$(kubectl get analysisruns -n voting-app-qa --sort-by='.metadata.creationTimestamp' -o name 2>/dev/null | tail -1)
+          
+          if [ -n "$LATEST" ]; then
+            echo "**Name:** \`$LATEST\`" >> $GITHUB_STEP_SUMMARY
+            echo '```yaml' >> $GITHUB_STEP_SUMMARY
+            kubectl get $LATEST -n voting-app-qa -o yaml 2>&1 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No analysis runs found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Get Analysis Run Events
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Analysis Run Events" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get events -n voting-app-qa --sort-by='.lastTimestamp' --field-selector reason!=Pulled,reason!=Created,reason!=Started 2>&1 | tail -30 >> $GITHUB_STEP_SUMMARY || echo "No events" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Get Analysis Template
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Analysis Template Being Used" >> $GITHUB_STEP_SUMMARY
+          
+          TEMPLATE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.spec.strategy.canary.analysis.templates[0].templateName}' 2>/dev/null || echo "unknown")
+          echo "**Template:** \`$TEMPLATE\`" >> $GITHUB_STEP_SUMMARY
+          
+          echo '```yaml' >> $GITHUB_STEP_SUMMARY
+          kubectl get analysistemplate $TEMPLATE -n voting-app-qa -o yaml 2>&1 >> $GITHUB_STEP_SUMMARY || echo "Template not found" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Check Argo Rollouts Controller Logs
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Argo Rollouts Controller Logs (last 50 lines)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl logs -n argo-rollouts -l app.kubernetes.io/name=argo-rollouts --tail=50 2>&1 >> $GITHUB_STEP_SUMMARY || echo "Could not get controller logs" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Check Secret Exists
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Secret Check" >> $GITHUB_STEP_SUMMARY
+          
+          if kubectl get secret newrelic-api-key -n voting-app-qa &>/dev/null; then
+            echo "✅ Secret \`newrelic-api-key\` exists" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Keys in secret:**" >> $GITHUB_STEP_SUMMARY
+            kubectl get secret newrelic-api-key -n voting-app-qa -o jsonpath='{.data}' | jq -r 'keys[]' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Secret \`newrelic-api-key\` NOT FOUND" >> $GITHUB_STEP_SUMMARY
+          fi
