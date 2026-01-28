@@ -1,0 +1,281 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                ║
+# ║           ENTERPRISE CD PIPELINE - PROMOTE TO STAGING (BLUE-GREEN)            ║
+# ║                                                                                ║
+# ║  Blue-Green deployment flow:                                                   ║
+# ║  • Auto-detect QA version OR accept manual input                               ║
+# ║  • Pre-flight check (QA health)                                                ║
+# ║  • Direct deployment to Staging (blue-green strategy)                          ║
+# ║  • Slack notification                                                          ║
+# ║                                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: "⬆️ CD: Promote to Staging"
+
+on:
+  # Auto-trigger after QA promote completes
+  workflow_run:
+    workflows: ["⬆️ CD: Promote to QA"]
+    types: [completed]
+    branches: [main]
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to promote (leave empty to auto-detect from QA)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: voting-app
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+  STAGING_URL: https://opsera-voting-app-staging.agent.opsera.dev
+  STAGING_RESULTS_URL: https://results.opsera-voting-app-staging.agent.opsera.dev
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # DETECT VERSION
+  # ════════════════════════════════════════════════════════════════════════════════
+  detect-version:
+    name: "🔍 Detect Version"
+    runs-on: ubuntu-latest
+    # Only run if QA promote succeeded (for auto-trigger) or manual dispatch
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      image_tag: ${{ steps.detect.outputs.image_tag }}
+      commit_hash: ${{ steps.detect.outputs.commit_hash }}
+      commit_url: ${{ steps.detect.outputs.commit_url }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Detect QA Version
+        id: detect
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          else
+            # Extract from QA kustomization
+            IMAGE_TAG=$(grep -A2 "name: vote$" .opsera-${{ env.APP_NAME }}/k8s/overlays/qa/kustomization.yaml | grep "newTag" | awk -F': ' '{print $2}' | tr -d ' "')
+          fi
+
+          COMMIT_HASH=$(echo "$IMAGE_TAG" | cut -d'-' -f1)
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/${COMMIT_HASH}"
+
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+          echo "commit_url=${COMMIT_URL}" >> $GITHUB_OUTPUT
+
+          echo "### 🔍 Version Detection" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag** | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | [${COMMIT_HASH}](${COMMIT_URL}) |" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # PRE-FLIGHT CHECK
+  # ════════════════════════════════════════════════════════════════════════════════
+  preflight-check:
+    name: "🔎 Pre-flight Check"
+    runs-on: ubuntu-latest
+    needs: [detect-version]
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Check QA Health
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          HEALTH=$(kubectl get application "${{ env.APP_NAME }}-qa" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+          SYNC=$(kubectl get application "${{ env.APP_NAME }}-qa" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+
+          echo "### 🔎 Pre-flight Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Health | Sync |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|--------|------|" >> $GITHUB_STEP_SUMMARY
+
+          [ "$HEALTH" = "Healthy" ] && H_EMOJI="🟢" || H_EMOJI="🔴"
+          [ "$SYNC" = "Synced" ] && S_EMOJI="✅" || S_EMOJI="⚠️"
+
+          echo "| QA | ${H_EMOJI} ${HEALTH} | ${S_EMOJI} ${SYNC} |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$HEALTH" != "Healthy" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Warning:** QA is not healthy. Proceeding anyway..." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO STAGING (Blue-Green)
+  # ════════════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: "🚀 Deploy to Staging (Blue-Green)"
+    runs-on: ubuntu-latest
+    needs: [detect-version, preflight-check]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update Staging Manifests
+        env:
+          IMAGE_TAG: ${{ needs.detect-version.outputs.image_tag }}
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          KUSTOMIZE_FILE=".opsera-${{ env.APP_NAME }}/k8s/overlays/staging/kustomization.yaml"
+
+          # Update all image tags
+          sed -i "s|newTag: .*|newTag: ${IMAGE_TAG}|g" "$KUSTOMIZE_FILE"
+
+          echo "### 📝 Staging Manifest Update" >> $GITHUB_STEP_SUMMARY
+          echo "Updated all services with tag: \`${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Strategy:** Blue-Green" >> $GITHUB_STEP_SUMMARY
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+          git add .
+          git diff --staged --quiet || git commit -m "chore(staging): promote ${{ needs.detect-version.outputs.image_tag }} from QA [skip ci]"
+          git push origin main || echo "No changes to push"
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Sync ArgoCD
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          # Hard refresh
+          kubectl patch application "${{ env.APP_NAME }}-staging" -n argocd \
+            --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}' || true
+
+          sleep 5
+
+          # Sync
+          kubectl patch application "${{ env.APP_NAME }}-staging" -n argocd \
+            --type merge -p '{"operation":{"initiatedBy":{"username":"github-actions"},"sync":{"prune":true}}}' || true
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # VERIFY & NOTIFY
+  # ════════════════════════════════════════════════════════════════════════════════
+  verify-and-notify:
+    name: "✅ Verify & Notify"
+    runs-on: ubuntu-latest
+    needs: [detect-version, deploy-staging]
+    if: always()
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Wait for Blue-Green Rollout
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+          echo "Waiting for Staging blue-green rollout to complete..."
+          # Blue-green rollouts complete faster than canary
+          kubectl rollout status rollout/vote-rollout -n ${{ env.APP_NAME }}-staging --timeout=180s || true
+          kubectl rollout status rollout/result-rollout -n ${{ env.APP_NAME }}-staging --timeout=180s || true
+
+      - name: Verify Deployment
+        run: |
+          echo "### ✅ Deployment Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Strategy:** Blue-Green (instant switchover)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check pod status
+          VOTE_READY=$(kubectl get pods -n ${{ env.APP_NAME }}-staging -l app=vote -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -c "True" || echo "0")
+          RESULT_READY=$(kubectl get pods -n ${{ env.APP_NAME }}-staging -l app=result -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -c "True" || echo "0")
+
+          echo "| Service | Ready Pods |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Vote | ${VOTE_READY} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | ${RESULT_READY} |" >> $GITHUB_STEP_SUMMARY
+
+          # Smoke test
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🧪 Smoke Test" >> $GITHUB_STEP_SUMMARY
+          VOTE_STATUS=$(curl -sSL -o /dev/null -w "%{http_code}" "${{ env.STAGING_URL }}" 2>/dev/null || echo "000")
+          RESULT_STATUS=$(curl -sSL -o /dev/null -w "%{http_code}" "${{ env.STAGING_RESULTS_URL }}" 2>/dev/null || echo "000")
+
+          [ "$VOTE_STATUS" = "200" ] && V_EMOJI="✅" || V_EMOJI="❌"
+          [ "$RESULT_STATUS" = "200" ] && R_EMOJI="✅" || R_EMOJI="❌"
+
+          echo "| URL | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| [Vote](${{ env.STAGING_URL }}) | ${V_EMOJI} ${VOTE_STATUS} |" >> $GITHUB_STEP_SUMMARY
+          echo "| [Result](${{ env.STAGING_RESULTS_URL }}) | ${R_EMOJI} ${RESULT_STATUS} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send Slack Notification
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then exit 0; fi
+
+          STATUS="${{ needs.deploy-staging.result }}"
+          [ "$STATUS" = "success" ] && EMOJI="✅" && COLOR="good" || EMOJI="❌" && COLOR="danger"
+
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "attachments": [{
+                "color": "'"${COLOR}"'",
+                "blocks": [
+                  {"type": "header", "text": {"type": "plain_text", "text": "'"${EMOJI}"' Staging Promotion Complete (Blue-Green)", "emoji": true}},
+                  {"type": "section", "fields": [
+                    {"type": "mrkdwn", "text": "*Image Tag:*\n`'"${{ needs.detect-version.outputs.image_tag }}"'`"},
+                    {"type": "mrkdwn", "text": "*Status:*\n'"${STATUS}"'"}
+                  ]},
+                  {"type": "actions", "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "🔍 View Staging"}, "url": "${{ env.STAGING_URL }}"}
+                  ]}
+                ]
+              }]
+            }' \
+            "$SLACK_WEBHOOK" || true

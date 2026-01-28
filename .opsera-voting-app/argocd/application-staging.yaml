@@ -1,0 +1,63 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: voting-app-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: voting-app
+    app.kubernetes.io/part-of: voting-app
+    environment: staging
+    deployment-strategy: bluegreen
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: alerts
+    # Blue-Green specific notifications
+    notifications.argoproj.io/subscribe.on-rollout-updated.slack: deployments
+    notifications.argoproj.io/subscribe.on-rollout-aborted.slack: alerts
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/opsera-agentic/voting-app-enterprise-1.git
+    targetRevision: main
+    path: .opsera-voting-app/k8s/overlays/staging
+
+  destination:
+    # Use cluster name, not server URL
+    name: opsera-usw2-np
+    namespace: voting-app-staging
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+      # Required for Argo Rollouts
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Ignore differences for Rollout status fields (managed by Argo Rollouts)
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas
+        - /status
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates/0/apiVersion
+        - /spec/volumeClaimTemplates/0/kind
