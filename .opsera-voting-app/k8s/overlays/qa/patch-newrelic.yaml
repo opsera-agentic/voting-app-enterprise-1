@@ -23,6 +23,9 @@ spec:
           value: "Environment:qa;Team:platform"
 ---
 # Patch for vote rollout
+# NOTE: For CRDs like Rollout, strategic merge replaces container arrays.
+# We must include all required fields (image, command, args, ports, resources, probes)
+# to preserve them when the patch is applied.
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
@@ -32,13 +35,74 @@ spec:
     spec:
       containers:
       - name: vote
+        image: vote:latest
+        imagePullPolicy: Always
+        command: ["gunicorn"]
+        args: ["app:app", "-b", "0.0.0.0:8080", "--log-file", "-", "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]
+        ports:
+        - containerPort: 8080
+          name: http
         env:
+        - name: OPTION_A
+          valueFrom:
+            configMapKeyRef:
+              name: voting-app-config
+              key: OPTION_A
+        - name: OPTION_B
+          valueFrom:
+            configMapKeyRef:
+              name: voting-app-config
+              key: OPTION_B
         - name: NEW_RELIC_APP_NAME
           value: "vote-qa"
+        - name: NEW_RELIC_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-api-key
+              key: api-key
+        - name: NEW_RELIC_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: newrelic-config
+              key: NEW_RELIC_HOST
+        - name: NEW_RELIC_LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: newrelic-config
+              key: NEW_RELIC_LOG_LEVEL
+        - name: NEW_RELIC_DISTRIBUTED_TRACING_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: newrelic-config
+              key: NEW_RELIC_DISTRIBUTED_TRACING_ENABLED
         - name: ENVIRONMENT
           value: "qa"
         - name: NEW_RELIC_LABELS
           value: "Environment:qa;Team:platform"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
   strategy:
     canary:
       analysis:
