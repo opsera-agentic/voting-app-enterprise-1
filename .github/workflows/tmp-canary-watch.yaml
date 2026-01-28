@@ -1,0 +1,189 @@
+name: "tmp: Canary Watch Dashboard"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to monitor (minutes)"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+jobs:
+  watch:
+    name: "📊 Live Canary Dashboard"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Tools
+        run: |
+          curl -sLO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl -sLO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Live Canary Dashboard
+        run: |
+          DURATION=${{ inputs.duration_minutes || '5' }}
+          CHECKS=$((DURATION * 4))  # Check every 15 seconds
+          
+          echo "# 🎯 Canary Deployment Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Monitoring for $DURATION minutes** ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get initial state
+          echo "## 📋 Configuration" >> $GITHUB_STEP_SUMMARY
+          TEMPLATE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.spec.strategy.canary.analysis.templates[0].templateName}' 2>/dev/null || echo "none")
+          IMAGE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d: -f2)
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Analysis Template | \`$TEMPLATE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`$IMAGE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | \`voting-app-qa\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📈 Progress Timeline" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          PREV_PHASE=""
+          PREV_WEIGHT=""
+          
+          for i in $(seq 1 $CHECKS); do
+            # Get current state
+            PHASE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            STEP=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.currentStepIndex}' 2>/dev/null || echo "0")
+            TOTAL_STEPS=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.spec.strategy.canary.steps}' 2>/dev/null | jq 'length' || echo "7")
+            WEIGHT=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.canary.weight}' 2>/dev/null || echo "0")
+            STABLE=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.stableRS}' 2>/dev/null | cut -c1-8)
+            CANARY=$(kubectl get rollout vote-rollout -n voting-app-qa -o jsonpath='{.status.canaryRS}' 2>/dev/null | cut -c1-8)
+            
+            # Only log if something changed
+            if [ "$PHASE" != "$PREV_PHASE" ] || [ "$WEIGHT" != "$PREV_WEIGHT" ]; then
+              TIME=$(date -u '+%H:%M:%S')
+              
+              # Emoji based on phase
+              case "$PHASE" in
+                Healthy) EMOJI="✅" ;;
+                Progressing) EMOJI="🔄" ;;
+                Paused) EMOJI="⏸️" ;;
+                Degraded) EMOJI="❌" ;;
+                *) EMOJI="⏳" ;;
+              esac
+              
+              # Progress bar
+              PCT=$((WEIGHT))
+              FILLED=$((PCT / 10))
+              EMPTY=$((10 - FILLED))
+              BAR=$(printf '█%.0s' $(seq 1 $FILLED 2>/dev/null) || echo "")
+              BAR="${BAR}$(printf '░%.0s' $(seq 1 $EMPTY 2>/dev/null) || echo "")"
+              
+              echo "### $EMOJI $TIME - $PHASE" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| Traffic Weight | **${WEIGHT}%** \`$BAR\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| Step | $STEP / $TOTAL_STEPS |" >> $GITHUB_STEP_SUMMARY
+              echo "| Stable RS | \`$STABLE\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| Canary RS | \`$CANARY\` |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              # Get analysis run status if exists
+              LATEST_AR=$(kubectl get analysisruns -n voting-app-qa --sort-by='.metadata.creationTimestamp' -o name 2>/dev/null | tail -1)
+              if [ -n "$LATEST_AR" ]; then
+                AR_NAME=$(echo $LATEST_AR | cut -d/ -f2)
+                AR_PHASE=$(kubectl get $LATEST_AR -n voting-app-qa -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                AR_MSG=$(kubectl get $LATEST_AR -n voting-app-qa -o jsonpath='{.status.message}' 2>/dev/null || echo "")
+                
+                case "$AR_PHASE" in
+                  Successful) AR_EMOJI="✅" ;;
+                  Running) AR_EMOJI="🔄" ;;
+                  Failed) AR_EMOJI="❌" ;;
+                  *) AR_EMOJI="⏳" ;;
+                esac
+                
+                echo "**Analysis Run:** $AR_EMOJI \`$AR_NAME\` - $AR_PHASE" >> $GITHUB_STEP_SUMMARY
+                if [ -n "$AR_MSG" ]; then
+                  echo "> $AR_MSG" >> $GITHUB_STEP_SUMMARY
+                fi
+                
+                # Get metric results
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "<details><summary>📊 Metric Results</summary>" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                kubectl get $LATEST_AR -n voting-app-qa -o jsonpath='{.status.metricResults}' 2>/dev/null | jq -r '.[] | "\(.name): \(.phase) (\(.count) measurements)"' 2>/dev/null || echo "No metrics yet"
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                echo "</details>" >> $GITHUB_STEP_SUMMARY
+              fi
+              
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "---" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              PREV_PHASE="$PHASE"
+              PREV_WEIGHT="$WEIGHT"
+            fi
+            
+            # Exit early if complete or failed
+            if [ "$PHASE" = "Healthy" ]; then
+              echo "## 🎉 Canary Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Duration:** $((i * 15)) seconds" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "All traffic is now on the new version." >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            
+            if [ "$PHASE" = "Degraded" ]; then
+              echo "## ❌ Canary Deployment Failed!" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Analysis failed - automatic rollback triggered.**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 || true
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+            
+            sleep 15
+          done
+          
+          # Final status
+          echo "## 📋 Final Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl-argo-rollouts get rollout vote-rollout -n voting-app-qa 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Pod status
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🐳 Pod Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n voting-app-qa -l app=vote -o wide 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Analysis history
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Analysis Run History" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get analysisruns -n voting-app-qa --sort-by='.metadata.creationTimestamp' 2>&1 | tail -10 || echo "None"
+          echo '```' >> $GITHUB_STEP_SUMMARY
